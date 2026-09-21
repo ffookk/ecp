@@ -1,6 +1,6 @@
 import {
   buildHeader,
-  parseHeader,
+  validatePacket,
   encodeUTF8,
   decodeUTF8,
   zeros,
@@ -23,16 +23,26 @@ import {
   signComposite,
   verifyComposite,
   constantTimeCompare,
+  randomUUID,
 } from './crypto.js';
 import {
-  getLocalFingerprint,
   getLocalIdentity,
   serializeIdentityPublic,
   parseIdentityPublic,
   calculateFingerprint,
 } from './identity.js';
 import { DB } from './storage.js';
-import type { Session } from './types.js';
+import { withStateLock } from './locks.js';
+import type { Session, Message } from './types.js';
+
+const INIT_FIXED = 4225 * 2 + 32 + 1568 + 4691;
+const INIT_SIZE = 12 + INIT_FIXED + 16;
+const RESP_SIZE = 3196;
+const MSG_OVERHEAD = 3220;
+const UINT32_MAX = 0xffffffff;
+
+// These buffers are per-operation derived values, never identity/session arrays.
+const clear = (...values: Uint8Array[]) => values.forEach((v) => v.fill(0));
 
 const deriveSymmetric = (
   mk: Uint8Array,
@@ -43,515 +53,583 @@ const deriveSymmetric = (
   nonce: hmacSHA256(mk, encodeUTF8(nonceLabel)).slice(0, 12),
 });
 
-const kdfRoot = (rk: Uint8Array, dh: Uint8Array, kem: Uint8Array) =>
-  hkdfSHA256(concatBytes(dh, kem), rk, encodeUTF8('ECP-DR-RK-v1'), 64);
+const kdfRoot = (rk: Uint8Array, dh: Uint8Array, kem: Uint8Array) => {
+  const ikm = concatBytes(dh, kem);
+  try {
+    return hkdfSHA256(ikm, rk, encodeUTF8('ECP-DR-RK-v2'), 64);
+  } finally {
+    clear(ikm, dh, kem);
+  }
+};
 
-const deriveInitKeys = (sk: Uint8Array) =>
-  deriveSymmetric(
-    hkdfSHA256(sk, zeros(32), encodeUTF8('ECP-INIT-MESSAGE-v1'), 32),
-    'ECP-AES256GCM-v1',
-    'ECP-INIT-NONCE',
-  );
+const initSecret = (dh: Uint8Array, kem: Uint8Array) => {
+  const ikm = concatBytes(encodeUTF8('ECP-INIT-v2'), dh, kem);
+  try {
+    return hkdfSHA256(ikm, zeros(32), encodeUTF8(''), 32);
+  } finally {
+    clear(ikm, dh, kem);
+  }
+};
+
+const deriveInitKeys = (sk: Uint8Array) => {
+  const mk = hkdfSHA256(sk, zeros(32), encodeUTF8('ECP-INIT-MESSAGE-v2'), 32);
+  try {
+    return deriveSymmetric(mk, 'ECP-AES256GCM-v2', 'ECP-INIT-NONCE-v2');
+  } finally {
+    clear(mk);
+  }
+};
 
 const deriveMsgKeys = (ck: Uint8Array) => {
   const mk = hmacSHA256(ck, new Uint8Array([0x01]));
-  const nextCk = hmacSHA256(ck, new Uint8Array([0x02]));
   return {
-    ...deriveSymmetric(mk, 'ECP-AES256GCM-v1', 'ECP-NONCE-v1'),
-    nextCk,
+    ...deriveSymmetric(mk, 'ECP-AES256GCM-v2', 'ECP-NONCE-v2'),
+    nextCk: hmacSHA256(ck, new Uint8Array([0x02])),
     mk,
   };
 };
 
-export async function CreateInit(contactFp: string, plaintextStr: string) {
-  const localFp = await getLocalFingerprint();
-  if (contactFp === localFp) throw new Error('Self-messaging is prohibited.');
-
-  const local = await getLocalIdentity();
-  const contact = await DB.get('contacts', contactFp);
-  if (!contact) throw new Error('Peer context is missing.');
-
-  const localPubBytes = serializeIdentityPublic(local);
-  const peerPubBytes = decodeBase64URL(contact.bundle);
-  const peerId = parseIdentityPublic(peerPubBytes);
-
-  const ekKP = keygenX25519();
-  const kemRes = encapsulateMLKEM1024(peerId.kemPk);
-  const dh1 = getSharedSecretX25519(ekKP.secretKey, peerId.dhPk);
-
-  const SK = hkdfSHA256(
-    concatBytes(encodeUTF8('ECP-INIT-v1'), dh1, kemRes.sharedSecret),
-    zeros(32),
-    encodeUTF8(''),
-    32,
-  );
-
-  const sigInput = concatBytes(
-    encodeUTF8('ECP-INIT-v1'),
-    localPubBytes,
-    peerPubBytes,
-    ekKP.publicKey,
-    kemRes.cipherText,
-  );
-  const sig = signComposite(sigInput, local.ecSk, local.dsaSk);
-
-  const initCrypto = deriveInitKeys(SK);
-  const payloadFixed = concatBytes(
-    localPubBytes,
-    peerPubBytes,
-    ekKP.publicKey,
-    kemRes.cipherText,
-    sig,
-  );
-
-  const ptextEnc = encodeUTF8(plaintextStr);
-  const header = buildHeader(
-    Config.PACKET_TYPES.INIT,
-    payloadFixed.length + ptextEnc.length + 16,
-  );
-  const aad = concatBytes(header, payloadFixed);
-
-  const ciphertext = encryptGCM(
-    initCrypto.key,
-    initCrypto.nonce,
-    ptextEnc,
-    aad,
-  );
-  const fullPacket = concatBytes(header, payloadFixed, ciphertext);
-
-  const convIdHash = sha256(
-    concatBytes(
-      encodeUTF8('ECP-CONVERSATION-v1'),
-      ekKP.publicKey,
-      kemRes.cipherText,
+const conversationId = (ek: Uint8Array, kemCt: Uint8Array) =>
+  encodeBase64URL(
+    sha256(concatBytes(encodeUTF8('ECP-CONVERSATION-v2'), ek, kemCt)).slice(
+      0,
+      16,
     ),
   );
 
-  const session: Session = {
-    contactFp,
-    version: 1,
-    conversationId: encodeBase64URL(convIdHash.slice(0, 16)),
-    peerIdentity: contact.bundle,
-    DHs: { sk: ekKP.secretKey, pk: ekKP.publicKey },
-    KEMs: { sk: local.kemSk, pk: local.kemPk },
-    KEMr: { pk: peerId.kemPk },
-    RK: hkdfSHA256(SK, zeros(32), encodeUTF8('ECP-DR-ROOT-v1'), 32),
-    Ns: 0,
-    Nr: 0,
-    PN: 0,
-    SK,
-    state: 'HANDSHAKE_SENT',
-  };
-
-  await DB.put('sessions', session);
-  return { packet: fullPacket, session };
+async function requirePeer(contactFp: string, expectedBundle?: string) {
+  const contact = await DB.get('contacts', contactFp);
+  if (!contact?.verified)
+    throw new Error('Peer must be independently verified before use.');
+  const bytes = decodeBase64URL(contact.bundle);
+  if (bytes.length !== 4225 || calculateFingerprint(bytes) !== contactFp)
+    throw new Error('Peer identity is inconsistent.');
+  if (
+    expectedBundle !== undefined &&
+    !constantTimeCompare(bytes, decodeBase64URL(expectedBundle))
+  )
+    throw new Error('Peer identity does not match the channel.');
+  return { contact, bytes, publicIdentity: parseIdentityPublic(bytes) };
 }
 
-export async function ProcessInit(packetBytes: Uint8Array) {
-  const local = await getLocalIdentity();
-  const localPubBytes = serializeIdentityPublic(local);
-  const { type, headerBytes } = parseHeader(packetBytes);
-  if (type !== Config.PACKET_TYPES.INIT)
-    throw new Error('Protocol type mismatch.');
+function checkSession(session: Session) {
+  if (session.version !== 2)
+    throw new Error('Unsupported stored protocol version.');
+  for (const counter of [session.Ns, session.Nr, session.PN])
+    if (!Number.isSafeInteger(counter) || counter < 0 || counter > UINT32_MAX)
+      throw new Error('Invalid ratchet counter.');
+}
 
-  let offset = 12;
-  const fixedPayloadLen = 4225 * 2 + 32 + 1568 + 4691;
-  if (packetBytes.length < 12 + fixedPayloadLen + 16)
-    throw new Error('INIT packet structural integrity check failed.');
-
-  const sIdBytes = packetBytes.slice(offset, (offset += 4225));
-  const rIdBytes = packetBytes.slice(offset, (offset += 4225));
-  const ekPubBytes = packetBytes.slice(offset, (offset += 32));
-  const kemCt = packetBytes.slice(offset, (offset += 1568));
-  const sig = packetBytes.slice(offset, (offset += 4691));
-  const ciphertext = packetBytes.slice(offset);
-
-  if (!constantTimeCompare(rIdBytes, localPubBytes))
-    throw new Error('INIT packet destination misrouted.');
-
-  const senderFp = calculateFingerprint(sIdBytes);
-  if (senderFp === (await getLocalFingerprint()))
-    throw new Error('Self-messaging is prohibited.');
-
-  const sigHash = encodeBase64URL(sha256(sig));
-  const existingSession = await DB.get('sessions', senderFp);
-  if (existingSession?.usedInitEks?.includes(sigHash))
-    throw new Error('INIT packet replay detected.');
-
-  const senderId = parseIdentityPublic(sIdBytes);
-  const sigInput = concatBytes(
-    encodeUTF8('ECP-INIT-v1'),
-    sIdBytes,
-    rIdBytes,
-    ekPubBytes,
-    kemCt,
-  );
-  if (!verifyComposite(sig, sigInput, senderId.ecPk, senderId.dsaPk))
-    throw new Error('INIT packet signature verification failed.');
-
-  let contact = await DB.get('contacts', senderFp);
-  if (!contact) {
-    contact = {
-      fingerprint: senderFp,
-      bundle: encodeBase64URL(sIdBytes),
-      name: 'Unknown Peer',
-      verified: false,
-      archived: false,
-      lastReadTimestamp: Date.now(),
-    };
-    await DB.put('contacts', contact);
-  }
-
-  const dh1 = getSharedSecretX25519(local.dhSk, ekPubBytes);
-  const kemSS = decapsulateMLKEM1024(kemCt, local.kemSk);
-  const SK = hkdfSHA256(
-    concatBytes(encodeUTF8('ECP-INIT-v1'), dh1, kemSS),
-    zeros(32),
-    encodeUTF8(''),
-    32,
-  );
-
-  const initCrypto = deriveInitKeys(SK);
-  const ptextBytes = decryptGCM(
-    initCrypto.key,
-    initCrypto.nonce,
-    ciphertext,
-    concatBytes(headerBytes, packetBytes.slice(12, 12 + fixedPayloadLen)),
-  );
-
-  const RK0 = hkdfSHA256(SK, zeros(32), encodeUTF8('ECP-DR-ROOT-v1'), 32);
-  const dhsKP = keygenX25519();
-  const nkemKP = keygenMLKEM1024();
-  const dh2 = getSharedSecretX25519(dhsKP.secretKey, ekPubBytes);
-  const kemRes2 = encapsulateMLKEM1024(senderId.kemPk);
-
-  const drIkm = kdfRoot(RK0, dh2, kemRes2.sharedSecret);
-  const convIdHash = sha256(
-    concatBytes(encodeUTF8('ECP-CONVERSATION-v1'), ekPubBytes, kemCt),
-  );
-
-  const respCrypto = deriveSymmetric(SK, 'ECP-RESP-v1', 'ECP-RESP-NONCE-v1');
-  const respPayload = concatBytes(
-    dhsKP.publicKey,
-    kemRes2.cipherText,
-    nkemKP.publicKey,
-  );
-  const respHdr = buildHeader(
-    Config.PACKET_TYPES.RESP,
-    respPayload.length + 16,
-  );
-  const respCt = encryptGCM(
-    respCrypto.key,
-    respCrypto.nonce,
-    respPayload,
-    respHdr,
-  );
-  const respPacket = concatBytes(respHdr, respCt);
-
-  const session: Session = {
-    contactFp: senderFp,
-    version: 1,
-    conversationId: encodeBase64URL(convIdHash.slice(0, 16)),
-    peerIdentity: contact.bundle,
-    DHs: { sk: dhsKP.secretKey, pk: dhsKP.publicKey },
-    DHr: { pk: ekPubBytes },
-    KEMs: { sk: nkemKP.secretKey, pk: nkemKP.publicKey },
-    KEMr: { pk: senderId.kemPk },
-    pendingKemCt: kemRes2.cipherText,
-    RK: drIkm.slice(0, 32),
-    CKs: drIkm.slice(32, 64),
-    Ns: 0,
-    Nr: 0,
-    PN: 0,
-    state: 'ESTABLISHED',
-    lastRespPacket: encodeBase64URL(respPacket),
-    usedInitEks: [...(existingSession?.usedInitEks ?? []), sigHash].slice(-100),
-  };
-
-  await DB.put('sessions', session);
+function messageRecord(session: Session, text: string, isMe: boolean): Message {
   return {
-    session,
-    plaintext: decodeUTF8(ptextBytes),
-    respPacket,
+    id: randomUUID(),
+    contactFp: session.contactFp,
+    conversationId: session.conversationId,
+    isMe,
+    text,
+    timestamp: Date.now(),
   };
 }
 
-export async function ProcessResp(packetBytes: Uint8Array) {
-  if (packetBytes.length < 3196) throw new Error('RESP packet is truncated.');
-
-  const { type, headerBytes } = parseHeader(packetBytes);
-  if (type !== Config.PACKET_TYPES.RESP)
-    throw new Error('Protocol type mismatch.');
-
-  const sessions = await DB.getAll('sessions');
-  const candidateSessions = sessions.filter(
-    (s) => s.state === 'HANDSHAKE_SENT' && s.SK,
-  );
-
-  let targetSession: Session | undefined;
-  let respPlaintext: Uint8Array | undefined;
-
-  for (const session of candidateSessions) {
-    if (!session.SK) continue;
-    const { key, nonce } = deriveSymmetric(
-      session.SK,
-      'ECP-RESP-v1',
-      'ECP-RESP-NONCE-v1',
-    );
-    try {
-      respPlaintext = decryptGCM(
-        key,
-        nonce,
-        packetBytes.slice(12),
-        headerBytes,
-      );
-      targetSession = session;
-      break;
-    } catch {}
-  }
-
-  if (!targetSession || !respPlaintext) {
-    const established = sessions.find(({ state }) => state === 'ESTABLISHED');
-    if (established) return { alreadyEstablished: true, session: established };
-    throw new Error(
-      'RESP packet processing failed: No matching handshake session found.',
-    );
-  }
-
-  const dhsPubBytes = respPlaintext.slice(0, 32);
-  const kemCt = respPlaintext.slice(32, 1600);
-  const kemPubBytes = respPlaintext.slice(1600, 3168);
-
-  const local = await getLocalIdentity();
-  const dh2 = getSharedSecretX25519(targetSession.DHs.sk, dhsPubBytes);
-  const kemSS2 = decapsulateMLKEM1024(kemCt, local.kemSk);
-
-  const drIkm = kdfRoot(targetSession.RK, dh2, kemSS2);
-
-  targetSession.RK = drIkm.slice(0, 32);
-  targetSession.CKr = drIkm.slice(32, 64);
-  delete targetSession.CKs;
-  targetSession.DHr = { pk: dhsPubBytes };
-  targetSession.KEMs = { sk: local.kemSk, pk: local.kemPk };
-  targetSession.KEMr = { pk: kemPubBytes };
-  targetSession.state = 'ESTABLISHED';
-  delete targetSession.SK;
-
-  await DB.put('sessions', targetSession);
-  return { alreadyEstablished: false, session: targetSession };
-}
-
-function stepDH(s: Session) {
-  if (!s.DHr || !s.KEMr)
-    throw new Error('Cannot advance DH ratchet: remote keys are missing.');
-
-  const nkp = keygenX25519();
-  const nkem = keygenMLKEM1024();
-  const kemRes = encapsulateMLKEM1024(s.KEMr.pk);
-  const dh2 = getSharedSecretX25519(nkp.secretKey, s.DHr.pk);
-
-  const drIkm = kdfRoot(s.RK, dh2, kemRes.sharedSecret);
-
-  s.RK = drIkm.slice(0, 32);
-  s.CKs = drIkm.slice(32, 64);
-  s.DHs = { sk: nkp.secretKey, pk: nkp.publicKey };
-  s.KEMs = { sk: nkem.secretKey, pk: nkem.publicKey };
-  s.pendingKemCt = kemRes.cipherText;
-}
-
-export async function EncryptMessage(session: Session, plaintextStr: string) {
-  if (session.state !== 'ESTABLISHED')
-    throw new Error('Channel state constraint violation.');
-  if (!session.CKs) stepDH(session);
-  if (!session.CKs || !session.pendingKemCt || !session.KEMs)
-    throw new Error('Missing sending chain (CKs).');
-
-  const { key, nonce, nextCk } = deriveMsgKeys(session.CKs);
-
-  const cIdBytes = decodeBase64URL(session.conversationId);
-  const lPubBytes = serializeIdentityPublic(await getLocalIdentity());
-  const headerVals = zeros(8);
-  const dv = new DataView(headerVals.buffer);
-  dv.setUint32(0, session.PN);
-  dv.setUint32(4, session.Ns);
-
-  const msgHdr = concatBytes(
-    cIdBytes,
-    session.DHs.pk,
-    session.pendingKemCt,
-    session.KEMs.pk,
-    headerVals,
-  );
-  const aad = concatBytes(
-    encodeUTF8('ECP-MSG-v1'),
-    cIdBytes,
-    lPubBytes,
-    decodeBase64URL(session.peerIdentity),
-    msgHdr,
-  );
-
-  const ct = encryptGCM(key, nonce, encodeUTF8(plaintextStr), aad);
-  const payload = concatBytes(msgHdr, ct);
-
-  session.CKs = nextCk;
-  session.Ns++;
-
-  await DB.put('sessions', session);
-  return concatBytes(
-    buildHeader(Config.PACKET_TYPES.MSG, payload.length),
-    payload,
-  );
-}
-
-export async function DecryptMessage(packetBytes: Uint8Array) {
-  if (packetBytes.length < 3220)
-    throw new Error('Invalid message packet length.');
-
-  const { type } = parseHeader(packetBytes);
-  if (type !== Config.PACKET_TYPES.MSG)
-    throw new Error('Protocol type mismatch.');
-
-  let offset = 12;
-  const cIdBytes = packetBytes.slice(offset, (offset += 16));
-  const dhPubBytes = packetBytes.slice(offset, (offset += 32));
-  const kemCt = packetBytes.slice(offset, (offset += 1568));
-  const kemPubBytes = packetBytes.slice(offset, (offset += 1568));
-
-  const dv = new DataView(
-    packetBytes.buffer,
-    packetBytes.byteOffset,
-    packetBytes.byteLength,
-  );
-  const pn = dv.getUint32(offset);
-  offset += 4;
-  const n = dv.getUint32(offset);
-  offset += 4;
-
-  const session = await DB.getByIndex(
-    'sessions',
-    'conversationId',
-    encodeBase64URL(cIdBytes),
-  );
-  if (!session)
-    throw new Error('Session not found for the provided Conversation ID.');
-  if (!session.DHr) throw new Error('Session missing remote DH keys.');
-
-  const aad = concatBytes(
-    encodeUTF8('ECP-MSG-v1'),
-    cIdBytes,
-    decodeBase64URL(session.peerIdentity),
-    serializeIdentityPublic(await getLocalIdentity()),
-    packetBytes.slice(12, 12 + 3192),
-  );
-
-  session.skippedKeys ??= {};
-  const dhKeyTag = encodeBase64URL(dhPubBytes);
-  const cacheKey = `${dhKeyTag}_${n}`;
-
-  if (session.skippedKeys[cacheKey]) {
-    const { key, nonce } = deriveSymmetric(
-      decodeBase64URL(session.skippedKeys[cacheKey]),
-      'ECP-AES256GCM-v1',
-      'ECP-NONCE-v1',
-    );
-    try {
-      const ptext = decryptGCM(key, nonce, packetBytes.slice(offset), aad);
-      delete session.skippedKeys[cacheKey];
-      await DB.put('sessions', session);
-      return { session, plaintext: decodeUTF8(ptext) };
-    } catch {
+/** INIT is exclusively a control packet. User content is sent after key confirmation. */
+export const CreateInit = (contactFp: string) =>
+  withStateLock(async () => {
+    const local = await getLocalIdentity();
+    const localPub = serializeIdentityPublic(local);
+    if (contactFp === calculateFingerprint(localPub))
+      throw new Error('Self-messaging is prohibited.');
+    const {
+      contact,
+      bytes: peerPub,
+      publicIdentity: peer,
+    } = await requirePeer(contactFp);
+    if (await DB.get('sessions', contactFp))
       throw new Error(
-        'Message decryption failed: AEAD tag mismatch on skipped key.',
+        'Reset the existing channel before starting another handshake.',
       );
+
+    const ek = keygenX25519();
+    const kem = encapsulateMLKEM1024(peer.kemPk);
+    const SK = initSecret(
+      getSharedSecretX25519(ek.secretKey, peer.dhPk),
+      kem.sharedSecret,
+    );
+    const transcript = concatBytes(
+      encodeUTF8('ECP-INIT-v2'),
+      localPub,
+      peerPub,
+      ek.publicKey,
+      kem.cipherText,
+    );
+    const signature = signComposite(transcript, local.ecSk, local.dsaSk);
+    const fixed = concatBytes(
+      localPub,
+      peerPub,
+      ek.publicKey,
+      kem.cipherText,
+      signature,
+    );
+    const header = buildHeader(Config.PACKET_TYPES.INIT, fixed.length + 16);
+    const symmetric = deriveInitKeys(SK);
+    let ciphertext: Uint8Array;
+    try {
+      ciphertext = encryptGCM(
+        symmetric.key,
+        symmetric.nonce,
+        zeros(0),
+        concatBytes(header, fixed),
+      );
+    } finally {
+      clear(symmetric.key, symmetric.nonce);
     }
-  }
+    const session: Session = {
+      contactFp,
+      version: 2,
+      conversationId: conversationId(ek.publicKey, kem.cipherText),
+      peerIdentity: contact.bundle,
+      DHs: { sk: ek.secretKey, pk: ek.publicKey },
+      KEMs: { sk: local.kemSk, pk: local.kemPk },
+      KEMr: { pk: peer.kemPk },
+      RK: hkdfSHA256(SK, zeros(32), encodeUTF8('ECP-DR-ROOT-v2'), 32),
+      Ns: 0,
+      Nr: 0,
+      PN: 0,
+      SK,
+      state: 'HANDSHAKE_SENT',
+    };
+    await DB.putMany([['sessions', session]]);
+    return { packet: concatBytes(header, fixed, ciphertext), session };
+  });
 
-  let tempCKr = session.CKr;
-  let tempRK = session.RK;
-  let tempPN = session.PN,
-    tempNs = session.Ns,
-    tempNr = session.Nr;
-  let stepped = false;
+export const ProcessInit = (packet: Uint8Array) =>
+  withStateLock(async () => {
+    validatePacket(packet, Config.PACKET_TYPES.INIT);
+    if (packet.length !== INIT_SIZE)
+      throw new Error(
+        'INIT must be a control-only packet with no user content.',
+      );
+    const local = await getLocalIdentity();
+    const localPub = serializeIdentityPublic(local);
+    let offset = 12;
+    const senderBytes = packet.slice(offset, (offset += 4225));
+    const receiverBytes = packet.slice(offset, (offset += 4225));
+    const ek = packet.slice(offset, (offset += 32));
+    const kemCt = packet.slice(offset, (offset += 1568));
+    const signature = packet.slice(offset, (offset += 4691));
+    if (!constantTimeCompare(receiverBytes, localPub))
+      throw new Error('INIT packet destination misrouted.');
+    const senderFp = calculateFingerprint(senderBytes);
+    if (senderFp === calculateFingerprint(localPub))
+      throw new Error('Self-messaging is prohibited.');
+    const {
+      contact,
+      bytes: knownBytes,
+      publicIdentity: sender,
+    } = await requirePeer(senderFp);
+    if (!constantTimeCompare(senderBytes, knownBytes))
+      throw new Error('INIT sender is not the verified peer.');
+    const transcript = concatBytes(
+      encodeUTF8('ECP-INIT-v2'),
+      senderBytes,
+      receiverBytes,
+      ek,
+      kemCt,
+    );
+    if (!verifyComposite(signature, transcript, sender.ecPk, sender.dsaPk))
+      throw new Error('INIT packet signature verification failed.');
+    // Transcript identity survives randomized signatures, channel reset and deletion.
+    const replayId = encodeBase64URL(
+      sha256(concatBytes(encodeUTF8('ECP-INIT-REPLAY-v2'), transcript)),
+    );
+    if (await DB.get('replays', replayId))
+      throw new Error('INIT packet replay detected.');
+    if (await DB.get('sessions', senderFp))
+      throw new Error(
+        'An active channel cannot be replaced by an incoming INIT.',
+      );
 
-  const stage: Session = { ...session };
-  const newSkippedKeys: Record<string, string> = {};
-
-  if (!constantTimeCompare(dhPubBytes, session.DHr.pk)) {
-    stepped = true;
-    if (tempCKr)
-      while (tempNr < pn) {
-        const { mk, nextCk } = deriveMsgKeys(tempCKr);
-        newSkippedKeys[`${encodeBase64URL(session.DHr.pk)}_${tempNr}`] =
-          encodeBase64URL(mk);
-        tempCKr = nextCk;
-        tempNr++;
+    const SK = initSecret(
+      getSharedSecretX25519(local.dhSk, ek),
+      decapsulateMLKEM1024(kemCt, local.kemSk),
+    );
+    try {
+      const symmetric = deriveInitKeys(SK);
+      let plaintext: Uint8Array;
+      try {
+        plaintext = decryptGCM(
+          symmetric.key,
+          symmetric.nonce,
+          packet.slice(offset),
+          packet.slice(0, offset),
+        );
+      } finally {
+        clear(symmetric.key, symmetric.nonce);
       }
+      if (plaintext.length) {
+        clear(plaintext);
+        throw new Error('INIT cannot contain user content.');
+      }
+      const RK0 = hkdfSHA256(SK, zeros(32), encodeUTF8('ECP-DR-ROOT-v2'), 32);
+      const dhs = keygenX25519();
+      const kems = keygenMLKEM1024();
+      const kem = encapsulateMLKEM1024(sender.kemPk);
+      const root = kdfRoot(
+        RK0,
+        getSharedSecretX25519(dhs.secretKey, ek),
+        kem.sharedSecret,
+      );
+      clear(RK0);
+      const respPayload = concatBytes(
+        dhs.publicKey,
+        kem.cipherText,
+        kems.publicKey,
+      );
+      const respHeader = buildHeader(
+        Config.PACKET_TYPES.RESP,
+        respPayload.length + 16,
+      );
+      const responseKeys = deriveSymmetric(
+        SK,
+        'ECP-RESP-v2',
+        'ECP-RESP-NONCE-v2',
+      );
+      let respPacket: Uint8Array;
+      try {
+        respPacket = concatBytes(
+          respHeader,
+          encryptGCM(
+            responseKeys.key,
+            responseKeys.nonce,
+            respPayload,
+            respHeader,
+          ),
+        );
+      } finally {
+        clear(responseKeys.key, responseKeys.nonce);
+      }
+      const session: Session = {
+        contactFp: senderFp,
+        version: 2,
+        conversationId: conversationId(ek, kemCt),
+        peerIdentity: contact.bundle,
+        DHs: { sk: dhs.secretKey, pk: dhs.publicKey },
+        DHr: { pk: ek },
+        KEMs: { sk: kems.secretKey, pk: kems.publicKey },
+        KEMr: { pk: sender.kemPk },
+        pendingKemCt: kem.cipherText,
+        RK: root.slice(0, 32),
+        CKs: root.slice(32, 64),
+        Ns: 0,
+        Nr: 0,
+        PN: 0,
+        state: 'ESTABLISHED',
+        lastRespPacket: encodeBase64URL(respPacket),
+      };
+      clear(root);
+      await DB.putMany([
+        ['replays', { id: replayId, contactFp: senderFp }],
+        ['sessions', session],
+      ]);
+      return { session, respPacket };
+    } finally {
+      clear(SK);
+    }
+  });
 
-    tempPN = tempNs;
-    tempNs = 0;
-    tempNr = 0;
-    if (!stage.KEMs)
-      throw new Error('Missing local KEM keys during ratchet step.');
+export const ProcessResp = (packet: Uint8Array) =>
+  withStateLock(async () => {
+    validatePacket(packet, Config.PACKET_TYPES.RESP);
+    if (packet.length !== RESP_SIZE)
+      throw new Error('Invalid RESP packet length.');
+    const digest = encodeBase64URL(sha256(packet));
+    const sessions = await DB.getAll('sessions');
+    for (const session of sessions) {
+      if (
+        session.version === 2 &&
+        session.state === 'ESTABLISHED' &&
+        session.acceptedRespHash === digest
+      ) {
+        await requirePeer(session.contactFp, session.peerIdentity);
+        return { alreadyEstablished: true, session };
+      }
+    }
+    for (const session of sessions) {
+      if (
+        session.version !== 2 ||
+        session.state !== 'HANDSHAKE_SENT' ||
+        !session.SK
+      )
+        continue;
+      checkSession(session);
+      await requirePeer(session.contactFp, session.peerIdentity);
+      const symmetric = deriveSymmetric(
+        session.SK,
+        'ECP-RESP-v2',
+        'ECP-RESP-NONCE-v2',
+      );
+      let plaintext: Uint8Array;
+      try {
+        plaintext = decryptGCM(
+          symmetric.key,
+          symmetric.nonce,
+          packet.slice(12),
+          packet.slice(0, 12),
+        );
+      } catch {
+        continue;
+      } finally {
+        clear(symmetric.key, symmetric.nonce);
+      }
+      const dh = plaintext.slice(0, 32);
+      const kemCt = plaintext.slice(32, 1600);
+      const kemPub = plaintext.slice(1600, 3168);
+      const local = await getLocalIdentity();
+      const root = kdfRoot(
+        session.RK,
+        getSharedSecretX25519(session.DHs.sk, dh),
+        decapsulateMLKEM1024(kemCt, local.kemSk),
+      );
+      session.RK = root.slice(0, 32);
+      session.CKr = root.slice(32, 64);
+      clear(root, plaintext);
+      delete session.CKs;
+      session.DHr = { pk: dh };
+      session.KEMs = { sk: local.kemSk, pk: local.kemPk };
+      session.KEMr = { pk: kemPub };
+      session.state = 'ESTABLISHED';
+      session.acceptedRespHash = digest;
+      delete session.SK;
+      await DB.putMany([['sessions', session]]);
+      return { alreadyEstablished: false, session };
+    }
+    throw new Error(
+      'RESP authentication failed: no matching pending handshake or exact accepted response.',
+    );
+  });
 
-    const dh1 = getSharedSecretX25519(stage.DHs.sk, dhPubBytes);
-    const kemSS = decapsulateMLKEM1024(kemCt, stage.KEMs.sk);
-    const drIkm1 = kdfRoot(tempRK, dh1, kemSS);
-
-    tempRK = drIkm1.slice(0, 32);
-    tempCKr = drIkm1.slice(32, 64);
-    stage.DHr = { pk: dhPubBytes };
-    stage.KEMr = { pk: kemPubBytes };
-
-    const nkp = keygenX25519();
-    const nkem = keygenMLKEM1024();
-    const kemRes = encapsulateMLKEM1024(stage.KEMr.pk);
-    const dh2 = getSharedSecretX25519(nkp.secretKey, stage.DHr.pk);
-
-    const drIkm2 = kdfRoot(tempRK, dh2, kemRes.sharedSecret);
-    tempRK = drIkm2.slice(0, 32);
-    stage.CKs = drIkm2.slice(32, 64);
-    stage.DHs = { sk: nkp.secretKey, pk: nkp.publicKey };
-    stage.KEMs = { sk: nkem.secretKey, pk: nkem.publicKey };
-    stage.pendingKemCt = kemRes.cipherText;
-  }
-
-  if (n < tempNr) throw new Error('Message frame out of order or replayed.');
-  if (n - tempNr > 2000) throw new Error('Excessive message gap.');
-
-  while (tempNr < n) {
-    if (!tempCKr)
-      throw new Error('Missing receiving chain (CKr) during key skipping.');
-    const { mk, nextCk } = deriveMsgKeys(tempCKr);
-    newSkippedKeys[`${dhKeyTag}_${tempNr}`] = encodeBase64URL(mk);
-    tempCKr = nextCk;
-    tempNr++;
-  }
-
-  if (!tempCKr)
-    throw new Error('Missing receiving chain (CKr) for final decryption.');
-
-  const { key, nonce, nextCk } = deriveMsgKeys(tempCKr);
-
-  let ptext: Uint8Array;
-  try {
-    ptext = decryptGCM(key, nonce, packetBytes.slice(offset), aad);
-  } catch {
-    throw new Error('Message decryption failed: AEAD tag mismatch.');
-  }
-
-  session.CKr = nextCk;
-  if (stepped) Object.assign(session, stage, { RK: tempRK });
-
-  session.PN = tempPN;
-  session.Ns = tempNs;
-  session.Nr = tempNr + 1;
-  session.skippedKeys = { ...session.skippedKeys, ...newSkippedKeys };
-
-  const ks = Object.keys(session.skippedKeys);
-  if (ks.length > 100)
-    for (const k of ks.slice(0, ks.length - 100)) delete session.skippedKeys[k];
-  delete session.lastRespPacket;
-
-  await DB.put('sessions', session);
-  return { session, plaintext: decodeUTF8(ptext) };
+function stepDH(session: Session) {
+  if (!session.DHr || !session.KEMr)
+    throw new Error('Remote ratchet keys are missing.');
+  const dh = keygenX25519();
+  const kemKeys = keygenMLKEM1024();
+  const kem = encapsulateMLKEM1024(session.KEMr.pk);
+  const root = kdfRoot(
+    session.RK,
+    getSharedSecretX25519(dh.secretKey, session.DHr.pk),
+    kem.sharedSecret,
+  );
+  session.RK = root.slice(0, 32);
+  session.CKs = root.slice(32, 64);
+  clear(root);
+  session.DHs = { sk: dh.secretKey, pk: dh.publicKey };
+  session.KEMs = { sk: kemKeys.secretKey, pk: kemKeys.publicKey };
+  session.pendingKemCt = kem.cipherText;
+  session.PN = session.Ns;
+  session.Ns = 0;
 }
+
+export const EncryptMessage = (contactFp: string, text: string) =>
+  withStateLock(async () => {
+    if (
+      typeof text !== 'string' ||
+      text.length > Config.MAX_PACKET_SIZE - MSG_OVERHEAD
+    )
+      throw new Error('Message exceeds maximum size.');
+    const plaintext = encodeUTF8(text);
+    try {
+      if (plaintext.length > Config.MAX_PACKET_SIZE - MSG_OVERHEAD)
+        throw new Error('Message exceeds maximum size.');
+      const session = await DB.get('sessions', contactFp);
+      if (!session || session.state !== 'ESTABLISHED')
+        throw new Error(
+          'An established channel is required before sending content.',
+        );
+      checkSession(session);
+      await requirePeer(contactFp, session.peerIdentity);
+      if (!session.CKs) stepDH(session);
+      if (!session.CKs || !session.pendingKemCt || !session.KEMs)
+        throw new Error('Missing sending chain.');
+      if (session.Ns >= UINT32_MAX)
+        throw new Error('Message counter exhausted; reset the channel.');
+      const symmetric = deriveMsgKeys(session.CKs);
+      const cId = decodeBase64URL(session.conversationId);
+      const localPub = serializeIdentityPublic(await getLocalIdentity());
+      const counters = zeros(8);
+      const view = new DataView(counters.buffer);
+      view.setUint32(0, session.PN);
+      view.setUint32(4, session.Ns);
+      const msgHeader = concatBytes(
+        cId,
+        session.DHs.pk,
+        session.pendingKemCt,
+        session.KEMs.pk,
+        counters,
+      );
+      const aad = concatBytes(
+        encodeUTF8('ECP-MSG-v2'),
+        cId,
+        localPub,
+        decodeBase64URL(session.peerIdentity),
+        msgHeader,
+      );
+      let ciphertext: Uint8Array;
+      try {
+        ciphertext = encryptGCM(symmetric.key, symmetric.nonce, plaintext, aad);
+      } finally {
+        clear(symmetric.key, symmetric.nonce, symmetric.mk);
+      }
+      session.CKs = symmetric.nextCk;
+      session.Ns++;
+      const payload = concatBytes(msgHeader, ciphertext);
+      const packet = concatBytes(
+        buildHeader(Config.PACKET_TYPES.MSG, payload.length),
+        payload,
+      );
+      await DB.putMany([
+        ['sessions', session],
+        ['messages', messageRecord(session, text, true)],
+      ]);
+      return { packet, session };
+    } finally {
+      clear(plaintext);
+    }
+  });
+
+export const DecryptMessage = (packet: Uint8Array) =>
+  withStateLock(async () => {
+    validatePacket(packet, Config.PACKET_TYPES.MSG);
+    if (packet.length < MSG_OVERHEAD)
+      throw new Error('Invalid message packet length.');
+    let offset = 12;
+    const cId = packet.slice(offset, (offset += 16));
+    const dh = packet.slice(offset, (offset += 32));
+    const kemCt = packet.slice(offset, (offset += 1568));
+    const kemPub = packet.slice(offset, (offset += 1568));
+    const view = new DataView(
+      packet.buffer,
+      packet.byteOffset,
+      packet.byteLength,
+    );
+    const pn = view.getUint32(offset);
+    offset += 4;
+    const n = view.getUint32(offset);
+    offset += 4;
+    if (n >= UINT32_MAX) throw new Error('Message counter exhausted.');
+    const session = await DB.getByIndex(
+      'sessions',
+      'conversationId',
+      encodeBase64URL(cId),
+    );
+    if (!session || session.state !== 'ESTABLISHED' || !session.DHr)
+      throw new Error('Established session not found for this message.');
+    checkSession(session);
+    await requirePeer(session.contactFp, session.peerIdentity);
+    const aad = concatBytes(
+      encodeUTF8('ECP-MSG-v2'),
+      cId,
+      decodeBase64URL(session.peerIdentity),
+      serializeIdentityPublic(await getLocalIdentity()),
+      packet.slice(12, offset),
+    );
+    const tag = encodeBase64URL(dh);
+    const cacheKey = `${tag}_${n}`;
+    const skipped = { ...session.skippedKeys };
+    if (Object.keys(skipped).length > Config.MAX_SKIP)
+      throw new Error('Invalid skipped-key cache.');
+    let plaintext: Uint8Array;
+    if (skipped[cacheKey]) {
+      const mk = decodeBase64URL(skipped[cacheKey]);
+      const symmetric = deriveSymmetric(mk, 'ECP-AES256GCM-v2', 'ECP-NONCE-v2');
+      try {
+        plaintext = decryptGCM(
+          symmetric.key,
+          symmetric.nonce,
+          packet.slice(offset),
+          aad,
+        );
+      } finally {
+        clear(mk, symmetric.key, symmetric.nonce);
+      }
+      delete skipped[cacheKey];
+    } else {
+      const changed = !constantTimeCompare(dh, session.DHr.pk);
+      const oldSkip = changed ? pn - session.Nr : 0;
+      const newSkip = n - (changed ? 0 : session.Nr);
+      // Both counters are unauthenticated here: validate the total before any loop or DH/KEM work.
+      if (oldSkip < 0 || newSkip < 0)
+        throw new Error('Message out of order or replayed.');
+      if (
+        oldSkip > Config.MAX_SKIP ||
+        newSkip > Config.MAX_SKIP ||
+        oldSkip + newSkip > Config.MAX_SKIP
+      )
+        throw new Error('Excessive message gap.');
+      if (oldSkip && !session.CKr)
+        throw new Error('Missing previous receiving chain.');
+      const remember = (key: string, mk: Uint8Array) => {
+        if (Object.keys(skipped).length >= Config.MAX_SKIP)
+          delete skipped[Object.keys(skipped)[0]];
+        skipped[key] = encodeBase64URL(mk);
+      };
+      let chain = session.CKr;
+      for (let i = 0; i < oldSkip; i++) {
+        const derived = deriveMsgKeys(chain!);
+        remember(
+          `${encodeBase64URL(session.DHr.pk)}_${session.Nr + i}`,
+          derived.mk,
+        );
+        chain = derived.nextCk;
+        clear(derived.mk, derived.key, derived.nonce);
+      }
+      if (changed) {
+        if (!session.KEMs) throw new Error('Missing local KEM keys.');
+        const receivedRoot = kdfRoot(
+          session.RK,
+          getSharedSecretX25519(session.DHs.sk, dh),
+          decapsulateMLKEM1024(kemCt, session.KEMs.sk),
+        );
+        session.RK = receivedRoot.slice(0, 32);
+        chain = receivedRoot.slice(32, 64);
+        clear(receivedRoot);
+        session.DHr = { pk: dh };
+        session.KEMr = { pk: kemPub };
+        session.Nr = 0;
+        stepDH(session);
+      }
+      for (let i = 0; i < newSkip; i++) {
+        if (!chain) throw new Error('Missing receiving chain.');
+        const derived = deriveMsgKeys(chain);
+        remember(`${tag}_${session.Nr + i}`, derived.mk);
+        chain = derived.nextCk;
+        clear(derived.mk, derived.key, derived.nonce);
+      }
+      if (!chain) throw new Error('Missing receiving chain.');
+      const derived = deriveMsgKeys(chain);
+      try {
+        plaintext = decryptGCM(
+          derived.key,
+          derived.nonce,
+          packet.slice(offset),
+          aad,
+        );
+      } finally {
+        clear(derived.key, derived.nonce, derived.mk);
+      }
+      // Apply the new receiving key after the DH/send-chain transition, never restore an old copy.
+      session.CKr = derived.nextCk;
+      session.Nr = n + 1;
+    }
+    session.skippedKeys = skipped;
+    delete session.lastRespPacket;
+    let text: string;
+    try {
+      text = decodeUTF8(plaintext);
+    } finally {
+      clear(plaintext);
+    }
+    await DB.putMany([
+      ['sessions', session],
+      ['messages', messageRecord(session, text, false)],
+    ]);
+    return { session, plaintext: text };
+  });

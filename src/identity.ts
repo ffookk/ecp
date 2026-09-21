@@ -8,15 +8,12 @@ import {
   sha256,
   encodeBase64URL,
 } from './crypto.js';
-import { Mutex } from './mutex.js';
+import { withNamedLock } from './locks.js';
 import { DB } from './storage.js';
 import type { Identity } from './types.js';
 
-const mutex = new Mutex();
-
-export const getLocalIdentity = async () => {
-  const unlock = await mutex.lock();
-  try {
+export const getLocalIdentity = async () =>
+  withNamedLock('identity', async () => {
     let id = await DB.get('identity', 'local');
 
     if (!id) {
@@ -39,10 +36,7 @@ export const getLocalIdentity = async () => {
       await DB.put('identity', id);
     }
     return id;
-  } finally {
-    unlock();
-  }
-};
+  });
 
 export const serializeIdentityPublic = (id: Identity) =>
   concatBytes(
@@ -54,7 +48,7 @@ export const serializeIdentityPublic = (id: Identity) =>
   );
 
 export const parseIdentityPublic = (bytes: Uint8Array) => {
-  if (bytes.length < 4225) throw new Error('Malformed identity packet.');
+  if (bytes.length !== 4225) throw new Error('Malformed identity packet.');
   if (bytes[0] !== Config.IDENTITY_VERSION)
     throw new Error('Unsupported identity version.');
   return {
@@ -70,7 +64,7 @@ export const calculateFingerprint = (identityBytes: Uint8Array) => {
   return encodeBase64URL(
     sha256(
       concatBytes(
-        new TextEncoder().encode('ECP-ID-v1'),
+        new TextEncoder().encode('ECP-ID-v2'),
         idPub.ecPk,
         idPub.dsaPk,
         idPub.dhPk,

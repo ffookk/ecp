@@ -2,11 +2,18 @@ import { Config } from './config.js';
 import { decodeBase64URL, encodeBase64URL } from './crypto.js';
 
 export const encodeUTF8 = (v: string) => new TextEncoder().encode(v);
-export const decodeUTF8 = (v: Uint8Array) => new TextDecoder().decode(v);
+export const decodeUTF8 = (v: Uint8Array) =>
+  new TextDecoder('utf-8', { fatal: true }).decode(v);
 
 export const zeros = (size: number) => new Uint8Array(size);
 
 export const buildHeader = (type: number, payloadLength: number) => {
+  if (
+    !Number.isSafeInteger(payloadLength) ||
+    payloadLength < 0 ||
+    payloadLength + 12 > Config.MAX_PACKET_SIZE
+  )
+    throw new Error('Packet exceeds maximum size limits.');
   const hdr = zeros(12);
   hdr.set(Config.PACKET_MAGIC, 0);
   hdr[4] = Config.WIRE_PROTOCOL_VERSION;
@@ -22,6 +29,9 @@ export const parseHeader = (bytes: Uint8Array) => {
       throw new Error('Packet magic byte mismatch.');
   if (bytes[4] !== Config.WIRE_PROTOCOL_VERSION)
     throw new Error('Unsupported wire protocol version.');
+  if (bytes[6] || bytes[7])
+    throw new Error('Reserved header fields must be zero.');
+  if (![1, 2, 3].includes(bytes[5])) throw new Error('Unknown packet type.');
   return {
     type: bytes[5],
     payloadLength: new DataView(
@@ -33,6 +43,18 @@ export const parseHeader = (bytes: Uint8Array) => {
   };
 };
 
+export const validatePacket = (bytes: Uint8Array, expectedType?: number) => {
+  const header = parseHeader(bytes);
+  if (
+    bytes.length > Config.MAX_PACKET_SIZE ||
+    header.payloadLength !== bytes.length - 12
+  )
+    throw new Error('Invalid packet size or trailing data.');
+  if (expectedType !== undefined && header.type !== expectedType)
+    throw new Error('Protocol type mismatch.');
+  return header;
+};
+
 export const formatEnvelope = (bytes: Uint8Array) =>
   `${Config.PREFIX}${encodeBase64URL(bytes)}`;
 
@@ -40,5 +62,17 @@ export const parseEnvelope = (str: string) => {
   const trimmed = str.trim();
   if (!trimmed.startsWith(Config.PREFIX))
     throw new Error('Invalid ECP envelope format.');
-  return decodeBase64URL(trimmed.substring(Config.PREFIX.length).trim());
+  const encoded = trimmed.substring(Config.PREFIX.length);
+  if (
+    encoded.length > Math.ceil((Config.MAX_PACKET_SIZE * 4) / 3) ||
+    !/^[A-Za-z0-9_-]+$/.test(encoded)
+  )
+    throw new Error('Invalid or oversized ECP envelope.');
+  const bytes = decodeBase64URL(encoded);
+  if (
+    bytes.length > Config.MAX_PACKET_SIZE ||
+    encodeBase64URL(bytes) !== encoded
+  )
+    throw new Error('Noncanonical or oversized ECP envelope.');
+  return bytes;
 };
