@@ -39,17 +39,19 @@ export interface Session {
   state: 'HANDSHAKE_SENT' | 'HANDSHAKE_RECEIVED' | 'ESTABLISHED';
   lastRespPacket?: string;
   skippedKeys?: Record<string, string>;
-  usedInitEks?: string[];
+  acceptedRespHash?: string;
 }
 
 export interface Message {
   id: string;
+  contactFp: string;
   conversationId: string;
   isMe: boolean;
   text: string;
   timestamp: number;
 }
 
-export interface AppSettings {
-  persistHandshakes: boolean;
+export interface ReplayRecord {
+  id: string;
+  contactFp: string;
 }

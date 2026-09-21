@@ -1,232 +1,110 @@
-# E2EE Clipboard Protocol (ECP)
+# ECP Hardened — Experimental
 
-A serverless, pure-frontend web implementation of the End-to-End Encrypted Clipboard Protocol (ECP). ECP enables secure, peer-to-peer encrypted messaging and rich media sharing across untrusted transport channels without requiring a backend server or central authority.
+A security-focused fork of [James Liu's E2EE Clipboard Protocol](https://github.com/jamesliu96/ecp). ECP is a browser application for manually exchanging encrypted messages and media through another transport, such as a messenger or email. It has no application messaging backend: you copy an encoded packet, deliver it yourself, and ask the recipient to read it.
 
-## Core Architecture
+**This is experimental software with a custom, independently unaudited protocol.** The changes in this fork address concrete implementation problems and add regression tests. They do not establish that the protocol is suitable for high-risk communications or make it equivalent to an independently reviewed messaging system. See [SECURITY.md](SECURITY.md) for the threat model and remaining limits.
 
-- **Zero-Backend Processing:** Operates strictly on the client side. Messages and media are exchanged out-of-band via user-selected transport channels, such as instant messengers, email, shared documents, social media, QR codes, or physical notes.
-- **Local Persistence:** Encrypted session states, keys, and identity profiles reside entirely within client-side `IndexedDB` storage.
-- **Post-Quantum Cryptography (PQC):** Combines classical cryptography with NIST Level 5 PQC standards via `@noble` libraries (`@noble/ciphers`, `@noble/curves`, `@noble/hashes`, `@noble/post-quantum`).
+## Compatibility and current status
 
-## Threat Model & Security Boundaries
+- This fork uses the incompatible **v2** wire format: `e2e2:` envelopes, `E2E2` packet magic, and protocol version `2`.
+- It creates a fresh identity in a new encrypted browser database. It does not import v1 identities, sessions, or history. Both participants must use this version and exchange and verify their new fingerprints.
+- There is no built-in backup, export/import, passphrase change, or recovery mechanism. Losing the passphrase, clearing browser storage, losing the browser profile, or browser storage eviction can permanently lose the identity and history.
+- Do not clone or restore an active session database. Restoring or simultaneously using copies can repeat ratchet state, including encryption keys and nonces. Use fresh identities and newly verified channels after a profile restore; vault encryption cannot establish the freshness of an entire valid database snapshot.
+- The implementation remains subject to independent protocol review, broader browser testing, and further hardening. The software and tests are not a security certification.
 
-### In-Scope Security Guarantees
+## Run a local build
 
-- **Transport Confidentiality & Integrity:** All ciphertexts copied to the clipboard remain secure even when transmitted over unencrypted or compromised communication channels.
-- **Post-Quantum Forward Secrecy & Break-In Recovery:** Every Double Ratchet turn continuously encapsulates a fresh **ML-KEM-1024** shared secret alongside classical **X25519** ECDH. Future quantum adversaries capturing transport payloads cannot decrypt historical or future sessions even if ephemeral ECDH keys are compromised.
-- **Authenticity & Non-Repudiation:** Initial handshake signatures using composite **Ed25519 + ML-DSA-87** prevent active person-in-the-middle (PITM) identity spoofing.
+Use Node.js **22 or newer**, npm, and a current browser with Web Crypto, IndexedDB, Web Locks, and clipboard support in a secure context. The bundled server uses the loopback interface; HTTPS is required when serving from a non-local origin. Browser permissions can affect clipboard access. The UI also depends on IndexedDB database enumeration to detect legacy data safely.
 
-### Out-of-Scope Risks
-
-- **Host Environment Integrity:** Malware, malicious browser extensions, or OS-level keyloggers/clipboard monitors running on the user's host machine.
-- **Side-Channel Probing:** Execution timing or memory access side-channels native to the JavaScript engine runtime environment.
-
-## Usage Lifecycle
-
-1. **Identity Generation:** Automatically generates a persistent cryptographic identity upon initial application boot.
-2. **Peer Registration:** Users exchange out-of-band public identity bundles to add contacts.
-3. **Session Initialization:** The initiator generates an `INIT` payload packet and transmits it to the peer to establish a Hybrid Double Ratchet session.
-4. **Encrypted Exchange:** Ciphertexts and media Data URIs are copied directly to the clipboard, transmitted across any third-party app, and pasted by the recipient to decrypt.
-
-## Development & Build Pipeline
-
-The application is written in standard TypeScript and styled with Tailwind CSS v4. To maintain verifiable build outputs, the project intentionally omits complex bundlers in favor of explicit CLI toolchains (`tsc`, Tailwind CLI, and static serving).
-
-### Commands
-
-- **Installation:** Clone the repository and install locked dependencies:
+From a checkout of this fork:
 
 ```sh
-npm install
-```
-
-- **Local Development:** Start the file watcher and static development server:
-
-```sh
+npm ci --ignore-scripts
+npm run check
 npm run dev
 ```
 
-- **Production Build:** Compile static JavaScript assets directly to root distribution files:
+Open [the local app](http://127.0.0.1:4173). `npm run check` runs TypeScript checking, Node tests, and a production build. `npm run dev` serves the existing `dist/` directory at `127.0.0.1:4173`; it is not a build watcher. After changing source files, build again with `npm run build` and reload the page.
+
+The build copies pinned Noble dependencies from the lockfile into local browser assets and writes `dist/SHA256SUMS.json`. These hashes help compare build artifacts; they are not a signed release attestation and do not authenticate a compromised build machine or hosting origin. Installing dependencies and running builds still requires trust in the selected source, package registry, lockfile, and local tooling.
+
+**Building and testing do not publish anything.** There is no automatic GitHub Pages deployment. Review any hosting decision separately and serve only the intended built artifacts.
+
+## Exchange a message
+
+1. Create a vault on each participant's browser. Choose a strong, unique passphrase; the application requires at least 12 characters, but length alone does not make a passphrase resistant to guessing. Keep it somewhere appropriate because there is no recovery.
+2. Use **Copy Identity Bundle** to exchange public bundles. On each side, choose **Link New Peer**, set a local alias, and enter the full fingerprint independently confirmed by that person. Compare through a separate trusted channel, such as an in-person conversation. A fingerprint delivered alongside the bundle on the same untrusted channel does not authenticate it.
+3. One participant selects the peer and starts the handshake. Deliver the copied **INIT** packet to the other participant, who selects **Read Clipboard Packet** or pastes the packet outside an input field. Both peers must already have verified each other's identities.
+4. Deliver the recipient's copied **RESP** packet back to the initiator and read it. INIT contains no user message. The initiator must process the response before sending message content.
+5. Compose a message or attach supported media, send it, and deliver the resulting encrypted packet. The recipient reads the packet to decrypt it. A copied packet or a locally displayed outgoing message is not a delivery receipt.
+
+The decoded input envelope is limited to 1 MiB, including protocol overhead. The UI limits selected media files to 700,000 bytes because data URLs and packet encoding add overhead. Large gaps in message delivery can be rejected: the protocol limits each operation to a combined 100 skipped positions and keeps at most 100 skipped message keys. Retain the original transport packets if you need to retry delivery; the application is not a reliable transport or synchronization service.
+
+To restart a channel, use **Wipe Channel State** on both sides before starting a new handshake. This deletes that peer's local session and message history while retaining the contact and handshake replay records. An incoming INIT cannot silently replace an active channel.
+
+## Local vault and locking
+
+Identity private keys, contact details, ratchet state, message text/media, and replay-record contents are encrypted in IndexedDB using a passphrase-derived AES-256-GCM key. The vault uses PBKDF2-HMAC-SHA-256 with 600,000 iterations and a random 16-byte salt. Each encrypted write uses a fresh random 12-byte IV. Authentication binds each record to its vault, store, and public record identifiers.
+
+Encryption does **not** conceal the whole database structure. Primary keys and required query indices remain visible, including contact fingerprints, conversation IDs, message IDs and replay-record hashes. Store names, record counts, ciphertext sizes, IVs, and password-derivation metadata are also visible. A copied vault allows offline passphrase guesses; choose a strong passphrase.
+
+Use **Global Settings → Lock now** to lock manually. The page also schedules a lock after five minutes without the pointer/keyboard activity it observes and locks on `pagehide`. Locking removes the application's current vault-key reference, aborts tracked transactions, clears displayed conversation data, and broadcasts a lock request to other tabs when BroadcastChannel is available. Browser suspension and timer throttling can delay automatic locking; use the manual control before leaving sensitive content unattended.
+
+An unlocked page can access plaintext. JavaScript strings, browser internals, garbage collection, device memory, swap, and browser extensions prevent a guarantee of memory erasure. Clearing selected buffers and hiding the UI do not make a compromised or previously inspected device safe.
+
+## Deletion, legacy data, and replay records
+
+**Delete Peer & History** removes that peer's contact, session, and all indexed local message history. Handshake replay records intentionally survive peer deletion and channel reset so that an old recorded INIT is not accepted as a new handshake. These records occupy storage over time; there is no automatic expiry policy. Their peer association is encrypted, while the replay identifier remains a visible record key.
+
+**Delete all local data** destroys the v2 vault, including its identity and replay records. This operation cannot be undone by the application.
+
+If the old `ECP_DB` database is detected, the unlock screen offers a separate, explicit **Delete old unencrypted data** action. The fork does not open that database for reading or migrate its contents. Creating a new encrypted vault does not encrypt or delete old data. Close old ECP tabs if they block deletion. Legacy data on a different origin or in another browser profile must be managed there.
+
+All deletion operations remove logical browser database records. They do not promise secure erasure from storage media, browser backups, filesystem snapshots, another device, a recipient's history, or the clipboard.
+
+## Protocol implementation
+
+The custom v2 protocol combines X25519, ML-KEM-1024, composite Ed25519 + ML-DSA-87 signatures, HKDF/HMAC-SHA-256 and AES-256-GCM. These are implemented through pinned Noble libraries; using established primitives does not establish the security of their composition here.
+
+The current implementation adds:
+
+- A control-only authenticated INIT and explicit response processing before the initiator sends content.
+- Verified-contact checks, exact packet framing, strict version handling, and size/counter limits.
+- An origin-wide Web Lock spanning each protocol read, cryptographic transition, and committed write. There is no weaker per-tab fallback.
+- Atomic encrypted batches for ratchet changes and message history, and for accepted handshakes and their replay records.
+- Transcript-based handshake replay tracking, exact accepted-RESP duplicate matching, and bounded out-of-order message handling.
+
+The wire layout, key schedule and state transitions are implemented in [src/codec.ts](src/codec.ts), [src/ratchet.ts](src/ratchet.ts), and [src/crypto.ts](src/crypto.ts). This README is not a complete interoperability specification. Do not reuse the protocol as a cryptographic standard without separate design and implementation review.
+
+No blanket forward-secrecy, post-compromise recovery, quantum-security, anonymity, or non-repudiation guarantee is made. In particular, plaintext message history is retained inside the vault: an adversary who obtains the unlocked vault or its passphrase can read that retained history regardless of transport-key deletion.
+
+## Hosting, transport, and clipboard boundaries
+
+For evaluation, prefer a reviewed local build on a device and browser you control. A remote hosting origin can replace the HTML or JavaScript that processes passphrases and plaintext. A content security policy or encrypted database cannot protect you from malicious first-party code delivered by that origin. The current page does not register an automatically updating service worker; a retirement worker is included for older deployments. Existing browser workers and cached content may still need to be cleared when changing deployments.
+
+The supplied application code has no messaging backend or analytics integration, but loading a hosted page still exposes ordinary web-request metadata to its host. The delivery service sees packet sizes, timing and routing. INIT exposes public identity bundles, and message packets expose conversation identifiers, ratchet public parameters and sequence counters. Those fields permit correlation.
+
+Clipboard managers, clipboard synchronization, other applications, screenshots and recipients are outside vault control. Locking or deleting a vault does not remove already copied packets or plaintext from those places.
+
+## Tests
+
+Run the complete local check:
 
 ```sh
-npm run build
+npm run check
 ```
 
-## ECP Protocol Specification (v1)
+Node regression tests exercise real protocol cryptography with isolated storage/lock adapters and exercise encrypted vault behavior with a test IndexedDB implementation. They cover multi-message ratchet turns, reordered and replayed packets, tampering, counter bounds, concurrent operations, transaction failures, vault locking and deletion. They do not constitute a cryptographic proof or exhaustive browser/OS coverage.
 
-### Cryptographic Primitive Stack
+For the browser integration suite, install Playwright's Chromium and run:
 
-| Role                         | Primitive     | Specification / Key Length        | Implementation Library                 |
-| ---------------------------- | ------------- | --------------------------------- | -------------------------------------- |
-| **Hybrid Key Exchange**      | ECDH + ML-KEM | X25519 + FIPS 203 ML-KEM-1024     | `@noble/curves`, `@noble/post-quantum` |
-| **Composite Signature**      | Signature     | Ed25519 + FIPS 204 ML-DSA-87      | `@noble/curves`, `@noble/post-quantum` |
-| **Symmetric Encryption**     | AES-256-GCM   | 256-bit Key, 96-bit Nonce         | `@noble/ciphers`                       |
-| **Key Derivation & Hashing** | HKDF / HMAC   | HMAC-SHA256 / HKDF-SHA256         | `@noble/hashes`                        |
-| **Wire Encoding & Envelope** | Base64URL     | Prefixed ASCII Envelope (`e2e1:`) | Native TS / Web APIs                   |
+```sh
+npx playwright install chromium
+npm run test:browser
+```
 
-### Framing & Wire Envelope Architecture
+On Linux, Playwright may also require its documented browser system dependencies. A locally installed compatible browser can be selected with the `ECP_BROWSER_PATH` environment variable. The suite builds the app, starts its own server on port 4173, and uses isolated browser contexts and a synthetic page-local clipboard. Stop any development server on that port first. It covers the visible vault/contact/handshake/message flow, wrong-passphrase handling, and concurrent operations from real tabs sharing one origin. Synthetic clipboard tests do not validate OS clipboard permissions or clipboard-history behavior.
 
-All serialized wire payloads are converted to raw binary arrays, encoded as unpadded Base64URL strings, and prefixed with the ASCII literal string `e2e1:` (e.g., `e2e1:<Base64URL>`).
+## Attribution and license
 
-#### Binary Header Layout (12 Bytes Total)
-
-Every binary packet begins with a mandatory 12-byte header.
-
-| Offset (Bytes) | Field Name     | Type       | Value / Range | Description                                         |
-| -------------- | -------------- | ---------- | ------------- | --------------------------------------------------- |
-| `0` – `3`      | Magic Bytes    | `Bytes[4]` | `E2E1`        | ASCII `E2E1` (`0x45`, `0x32`, `0x45`, `0x31`)       |
-| `4`            | Version        | `UInt8`    | `0x01`        | Wire Protocol Version                               |
-| `5`            | Packet Type    | `UInt8`    | `0x01`–`0x03` | `0x01`: INIT, `0x02`: RESP, `0x03`: MSG             |
-| `6` – `7`      | Reserved       | `Bytes[2]` | `0x0000`      | Zero-padded byte alignment                          |
-| `8` – `11`     | Payload Length | `UInt32BE` | Integer       | Big-Endian size of subsequent payload body in bytes |
-
-### Identity Bundle Layout (4,225 Bytes Total)
-
-An Identity Bundle encapsulates a peer's public keys for identity verification and hybrid key agreement.
-
-| Field Name                 | Offset (Bytes)  | Size (Bytes) | Primitive   | Description                                  |
-| -------------------------- | --------------- | ------------ | ----------- | -------------------------------------------- |
-| **Bundle Version**         | `0`             | 1            | `UInt8`     | Format identifier (`0x01`)                   |
-| **Ed25519 Public Key**     | `1` – `32`      | 32           | Ed25519     | Classical signature verification key         |
-| **ML-DSA-87 Public Key**   | `33` – `2624`   | 2,592        | ML-DSA-87   | Post-quantum signature verification key      |
-| **X25519 Public Key**      | `2625` – `2656` | 32           | X25519      | Static ECDH key agreement target             |
-| **ML-KEM-1024 Public Key** | `2657` – `4224` | 1,568        | ML-KEM-1024 | Static post-quantum key encapsulation target |
-
-### Packet Types & Serialization Specs
-
-#### 1. INIT Packet Layout (`0x01`)
-
-Used by the initiator to initiate a session, perform initial hybrid key agreement, and transmit the first encrypted message.
-
-| Relative Offset   | Field Name                                 | Type / Size   | Description                                                    |
-| ----------------- | ------------------------------------------ | ------------- | -------------------------------------------------------------- |
-| `0` – `11`        | **Binary Header**                          | `Bytes[12]`   | Standard 12-byte header (`Type = 0x01`)                        |
-| `12` – `4236`     | **Sender Identity Bundle**                 | `Bytes[4225]` | Initiator's public Identity Bundle                             |
-| `4237` – `8461`   | **Receiver Identity Bundle**               | `Bytes[4225]` | Target recipient's public Identity Bundle                      |
-| `8462` – `8493`   | **Ephemeral X25519 PK ($EK_{\text{pk}}$)** | `Bytes[32]`   | Ephemeral X25519 Public Key generated by initiator             |
-| `8494` – `10061`  | **ML-KEM Ciphertext ($KEM_{\text{ct}}$)**  | `Bytes[1568]` | Encapsulated shared secret against receiver's static ML-KEM PK |
-| `10062` – `14752` | **Composite Signature ($Sig$)**            | `Bytes[4691]` | Ed25519 Sig (64B) + ML-DSA-87 Sig (4627B) over setup data      |
-| `14753`+          | **Payload Ciphertext**                     | Variable      | AES-256-GCM ciphertext of initial message string + 16B Tag     |
-
-#### 2. RESP Packet Layout (`0x02`)
-
-Sent by the responder to complete initial key setup and establish receiving/sending ratchet chains.
-
-| Relative Offset | Field Name            | Type / Size   | Description                                         |
-| --------------- | --------------------- | ------------- | --------------------------------------------------- |
-| `0` – `11`      | **Binary Header**     | `Bytes[12]`   | Standard 12-byte header (`Type = 0x02`)             |
-| `12` – `3179`   | **Encrypted Payload** | `Bytes[3168]` | AES-256-GCM encrypted parameters (derived via $SK$) |
-| `3180` – `3195` | **AES-256-GCM Tag**   | `Bytes[16]`   | AEAD authentication tag                             |
-
-##### RESP Plaintext Decrypted Payload (3,168 Bytes Total)
-
-| Decrypted Offset | Field Name                        | Type / Size   | Description                                                              |
-| ---------------- | --------------------------------- | ------------- | ------------------------------------------------------------------------ |
-| `0` – `31`       | **Responder Ephemeral DH PK**     | `Bytes[32]`   | Responder's ephemeral X25519 Public Key ($DH_{s,\text{pk}}$)             |
-| `32` – `1599`    | **ML-KEM Encapsulation CT**       | `Bytes[1568]` | Encapsulated secret ($KEM_{\text{ct2}}$) to initiator's static ML-KEM PK |
-| `1600` – `3167`  | **Responder Ephemeral ML-KEM PK** | `Bytes[1568]` | Fresh ML-KEM Public Key ($KEM_{s,\text{pk}}$) for next ratchet step      |
-
-#### 3. MSG Packet Layout (`0x03`)
-
-Carries active Hybrid Double Ratchet session messages.
-
-| Relative Offset | Field Name                                    | Type / Size   | Description                                                      |
-| --------------- | --------------------------------------------- | ------------- | ---------------------------------------------------------------- |
-| `0` – `11`      | **Binary Header**                             | `Bytes[12]`   | Standard 12-byte header (`Type = 0x03`)                          |
-| `12` – `27`     | **Conversation ID**                           | `Bytes[16]`   | First 16 bytes of SHA-256 hash over initial handshake parameters |
-| `28` – `59`     | **Ephemeral DH Key ($DH_{s,\text{pk}}$)**     | `Bytes[32]`   | Current ratchet step X25519 Public Key                           |
-| `60` – `1627`   | **ML-KEM Ciphertext ($KEM_{\text{ct}}$)**     | `Bytes[1568]` | Encapsulated secret for current ratchet turn                     |
-| `1628` – `3195` | **Ephemeral ML-KEM PK ($KEM_{s,\text{pk}}$)** | `Bytes[1568]` | Fresh ML-KEM Public Key for peer's subsequent ratchet turn       |
-| `3196` – `3199` | **Previous Chain Length ($PN$)**              | `UInt32BE`    | Number of messages sent in previous sending chain                |
-| `3200` – `3203` | **Message Sequence ($N_s$)**                  | `UInt32BE`    | Zero-indexed message counter in current sending chain            |
-| `3204`+         | **Payload Ciphertext**                        | Variable      | AES-256-GCM ciphertext of UTF-8 message body + 16B Tag           |
-
-### Authenticated Additional Data (AAD) Construction
-
-To bind ciphertexts to wire headers and identity structures, AEAD operations require exact AAD byte concatenations:
-
-- **INIT Packet (`0x01`):**
-
-$$\text{AAD}_{\text{INIT}} = \text{Header}_{12\text{B}} \parallel \text{SenderBundle}_{4225\text{B}} \parallel \text{ReceiverBundle}_{4225\text{B}} \parallel EK_{\text{pk}, 32\text{B}} \parallel KEM_{\text{ct}, 1568\text{B}} \parallel Sig_{4691\text{B}}$$
-
-- **RESP Packet (`0x02`):**
-
-$$\text{AAD}_{\text{RESP}} = \text{Header}_{12\text{B}}$$
-
-- **MSG Packet (`0x03`):**
-
-$$\text{AAD}_{\text{MSG}} = \mathtt{"ECP-MSG-v1"} \parallel \text{ConvID}_{16\text{B}} \parallel \text{SenderIdentity}_{4225\text{B}} \parallel \text{ReceiverIdentity}_{4225\text{B}} \parallel \text{msgHdr}_{3192\text{B}}$$
-
-_(Note: $\text{msgHdr}$ is the unencrypted 3,192-byte header payload spanning offsets `12` through `3203` of the MSG packet)._
-
-### Cryptographic Derivations & Key Schedules
-
-#### Auxiliary Symmetric Derivation Helper $f_{\text{sym}}$
-
-Symmetric encryption keys and nonces are derived from a master key ($MK$) using:
-
-$$\begin{aligned} f_{\text{sym}}(MK, \text{keyLabel}, \text{nonceLabel}) = \big( & \text{key} = \text{HKDF-SHA256}(MK, \text{0x00}^{32}, \text{UTF8}(\text{keyLabel}), 32), \\ & \text{nonce} = \text{HMAC-SHA256}(MK, \text{UTF8}(\text{nonceLabel}))[0 \dots 11] \big) \end{aligned}$$
-
-#### 1. INIT Handshake Key Schedule
-
-1. **Shared Key ($SK$):** Initiator computes ECDH shared secret $dh_1 = \text{X25519}(EK_{\text{sk}}, PeerID_{\text{dhPk}})$ and decapsulates/encapsulates $KEM_{\text{SS}}$.
-
-$$SK = \text{HKDF-SHA256}\left(\mathtt{"ECP-INIT-v1"} \parallel dh_1 \parallel KEM_{\text{SS}}, \text{salt}=\text{0x00}^{32}, \text{info}=\mathtt{""}, 32\right)$$
-
-2. **INIT Payload Encryption Keys:**
-
-$$MK_{\text{init}} = \text{HKDF-SHA256}(SK, \text{0x00}^{32}, \mathtt{"ECP-INIT-MESSAGE-v1"}, 32)$$
-
-$$\text{Keys}_{\text{init}} = f_{\text{sym}}(MK_{\text{init}}, \mathtt{"ECP-AES256GCM-v1"}, \mathtt{"ECP-INIT-NONCE"})$$
-
-3. **Composite Signature Generation:** Initiator signs the setup vector:
-
-$$Sig = \text{Sign}_{\text{Composite}}\left(\mathtt{"ECP-INIT-v1"} \parallel SenderID \parallel ReceiverID \parallel EK_{\text{pk}} \parallel KEM_{\text{ct}}\right)$$
-
-_(Constructed by concatenating Ed25519 signature [64 bytes] and ML-DSA-87 signature [4,627 bytes])._
-
-4. **Conversation Identifier ($\text{ConvID}$):**
-
-$$\text{ConvID} = \text{SHA256}\left(\mathtt{"ECP-CONVERSATION-v1"} \parallel EK_{\text{pk}} \parallel KEM_{\text{ct}}\right)[0 \dots 15]$$
-
-5. **Initial Root Key ($RK_0$):**
-
-$$RK_0 = \text{HKDF-SHA256}(SK, \text{0x00}^{32}, \mathtt{"ECP-DR-ROOT-v1"}, 32)$$
-
-#### 2. RESP Handshake Key Schedule
-
-1. **RESP Payload Encryption Keys:** Derived directly from $SK$:
-
-$$\text{Keys}_{\text{resp}} = f_{\text{sym}}(SK, \mathtt{"ECP-RESP-v1"}, \mathtt{"ECP-RESP-NONCE-v1"})$$
-
-2. **First Ratchet Step Derivation:** Responder generates $DH_s$ and $KEM_{\text{Res2}}$, computing $dh_2 = \text{X25519}(DH_{s,\text{sk}}, EK_{\text{pk}})$.
-
-$$RK_1 \parallel CK_s = \text{HKDF-SHA256}\left(dh_2 \parallel KEM_{\text{Res2SS}}, \text{salt}=RK_0, \text{info}=\mathtt{"ECP-DR-RK-v1"}, 64\right)$$
-
-#### 3. Double Ratchet Step & Chain Progression
-
-1. **DH / KEM Ratchet Step ($kdfRoot$):** Executed whenever a message is sent/received with a new ratchet key:
-
-$$RK_{i+1} \parallel CK_{\text{new}} = \text{HKDF-SHA256}\left(dh_{\text{shared}} \parallel KEM_{\text{SS}}, \text{salt}=RK_i, \text{info}=\mathtt{"ECP-DR-RK-v1"}, 64\right)$$
-
-2. **Symmetric Chain Key Progression:** Advance chain key $CK$ to produce message key $MK$:
-
-$$
-\begin{aligned}
-MK &= \text{HMAC-SHA256}(CK, \text{0x01}) \\
-CK_{\text{next}} &= \text{HMAC-SHA256}(CK, \text{0x02})
-\end{aligned}
-$$
-
-3. **Per-Message Symmetric Key & Nonce Derivation:**
-
-$$\text{Keys}_{\text{msg}} = f_{\text{sym}}(MK, \mathtt{"ECP-AES256GCM-v1"}, \mathtt{"ECP-NONCE-v1"})$$
-
-### Session State Machine & Replay Protection
-
-- **Replay Protection via Handshake Signature Tracking (`usedInitEks`):** Receivers store the SHA-256 hash of processed INIT packet signatures (`sigHash = Base64URL(SHA256(Sig))`). Re-sent or duplicated INIT packets matching any stored signature hash in `usedInitEks` (retaining up to 100 historical entries) are immediately discarded with `"INIT packet replay detected"`.
-- **Out-of-Order Message Handling & Skipped Key Cache (`skippedKeys`):** If a message arrives with sequence index $N > N_r$, intermediate message keys are derived via symmetric chain steps and stored in `skippedKeys` using the lookup key `${encodeBase64URL(DH_r.pk)}_${seq}`. The skipped key cache retains a maximum of 100 keys; older keys are pruned.
-- **Frame Validation Limits:**
-- **Sequence Progression:** Received index $N < N_r$ throws `"Message frame out of order or replayed"`.
-- **Maximum Gap Bound:** If $N - N_r > 2000$, decryption aborts with `"Excessive message gap"`.
-- **Destination Verification:** Receivers execute constant-time memory comparisons on identity bundles (`constantTimeCompare(rIdBytes, localPubBytes)`). Misrouted packets raise `"INIT packet destination misrouted"`.
+This fork is derived from [jamesliu96/ecp](https://github.com/jamesliu96/ecp), originally authored by James Liu. The original copyright notice and [MIT license](LICENSE) are retained. Hardening changes in this fork are separate from upstream and do not imply upstream endorsement or an independent security audit.

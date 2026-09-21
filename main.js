@@ -1,6 +1,7 @@
 import { Config } from './config.js';
-import { concatBytes, decodeBase64URL, randomUUID, encodeBase64URL, } from './crypto.js';
-import { DB, Settings } from './storage.js';
+import { concatBytes, decodeBase64URL, encodeBase64URL } from './crypto.js';
+import { DB, Vault } from './storage.js';
+import { withStateLock } from './locks.js';
 import { formatEnvelope, parseEnvelope, parseHeader } from './codec.js';
 import { calculateFingerprint, getLocalFingerprint, getLocalIdentity, serializeIdentityPublic, } from './identity.js';
 import { CreateInit, EncryptMessage, ProcessInit, ProcessResp, DecryptMessage, } from './ratchet.js';
@@ -9,6 +10,15 @@ const State = {
     showArchived: false,
     searchQuery: '',
 };
+let selectionSeq = 0;
+let sidebarSeq = 0;
+const mediaReaders = new Set();
+function cancelMediaReads() {
+    for (const reader of mediaReaders)
+        reader.abort();
+    mediaReaders.clear();
+    UI.$('#media-input').value = '';
+}
 let toastTimer;
 const UI = {
     $: (s) => {
@@ -29,6 +39,8 @@ const UI = {
         }, duration);
     },
     showModal: (containerHtml) => {
+        if (!Vault.isUnlocked())
+            return;
         UI.$('#modal-container').innerHTML = containerHtml;
         UI.$('#modal-overlay').classList.remove('hidden');
         UI.$('#modal-overlay').classList.add('flex');
@@ -43,6 +55,8 @@ const UI = {
     },
 };
 UI.$('#modal-overlay').onclick = () => UI.closeModal();
+UI.$('#modal-container').onclick = (event) => event.stopPropagation();
+UI.$('#metadata-overlay > div').onclick = (event) => event.stopPropagation();
 const closePeerDropdown = () => UI.$('#peer-dropdown').classList.add('hidden');
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
@@ -52,6 +66,10 @@ document.addEventListener('keydown', (e) => {
     }
 });
 function resetChatView(updateHash = true) {
+    selectionSeq++;
+    renderSeq++;
+    cancelMediaReads();
+    UI.$('#chat-input').value = '';
     delete State.currentContactFp;
     if (updateHash && location.hash)
         history.replaceState(null, '', location.pathname + location.search);
@@ -67,10 +85,14 @@ function resetChatView(updateHash = true) {
 }
 async function copyToClipboard(text, msg) {
     try {
+        if (!Vault.isUnlocked())
+            throw new Error('Vault is locked.');
         await navigator.clipboard.writeText(text);
         UI.showToast(msg);
     }
     catch (err) {
+        if (!Vault.isUnlocked())
+            return;
         console.warn('[Clipboard] Write error, falling back to modal:', err);
         UI.showModal(`
       <div class="p-4 border-b border-slate-800"><h3 class="font-bold text-slate-200">Manual Copy Required</h3></div>
@@ -83,7 +105,8 @@ async function copyToClipboard(text, msg) {
       </div>
     `);
         requestAnimationFrame(() => {
-            UI.$('#fallback-text').textContent = text;
+            if (Vault.isUnlocked())
+                UI.$('#fallback-text').textContent = text;
         });
         UI.$('#btn-close-fallback').onclick = UI.closeModal;
     }
@@ -92,7 +115,14 @@ async function handleOutgoing(packetBase64, bundleBase64) {
     await copyToClipboard(formatEnvelope(decodeBase64URL(bundleBase64 ?? packetBase64)), `Encrypted ${typeof bundleBase64 !== 'undefined' ? 'Bundle' : 'Packet'} Copied`);
 }
 async function renderSidebar() {
-    UI.$('#my-fingerprint').textContent = calculateFingerprint(serializeIdentityPublic(await getLocalIdentity()));
+    const sequence = ++sidebarSeq;
+    const generation = uiGeneration;
+    const identity = await getLocalIdentity();
+    if (!Vault.isUnlocked() ||
+        generation !== uiGeneration ||
+        sequence !== sidebarSeq)
+        return;
+    UI.$('#my-fingerprint').textContent = calculateFingerprint(serializeIdentityPublic(identity));
     let contacts = await DB.getAll('contacts');
     if (!State.showArchived)
         contacts = contacts.filter(({ archived }) => !archived);
@@ -145,12 +175,25 @@ async function renderSidebar() {
         };
         frag.appendChild(div);
     }
-    UI.$('#contacts-list').replaceChildren(frag);
+    if (Vault.isUnlocked() &&
+        generation === uiGeneration &&
+        sequence === sidebarSeq)
+        UI.$('#contacts-list').replaceChildren(frag);
 }
 async function selectContact(fp, isNavigatingHistory = false) {
     if (fp === State.currentContactFp)
         return;
+    const selection = ++selectionSeq;
+    const generation = uiGeneration;
+    renderSeq++;
+    cancelMediaReads();
+    UI.$('#chat-input').value = '';
+    UI.$('#chat-input-area').classList.add('hidden');
     const contact = await DB.get('contacts', fp);
+    if (selection !== selectionSeq ||
+        generation !== uiGeneration ||
+        !Vault.isUnlocked())
+        return;
     if (!contact) {
         resetChatView(true);
         return;
@@ -165,8 +208,13 @@ async function selectContact(fp, isNavigatingHistory = false) {
     }
     State.currentContactFp = fp;
     UI.$('#chat-messages').replaceChildren();
-    contact.lastReadTimestamp = Date.now();
-    await DB.put('contacts', contact);
+    await updateContact(fp, (current) => {
+        current.lastReadTimestamp = Date.now();
+    });
+    if (selection !== selectionSeq ||
+        generation !== uiGeneration ||
+        !Vault.isUnlocked())
+        return;
     UI.$('#sidebar-view').classList.add('max-md:hidden');
     UI.$('#chat-view').classList.remove('hidden');
     UI.$('#chat-view').classList.add('flex');
@@ -185,12 +233,16 @@ async function selectContact(fp, isNavigatingHistory = false) {
 }
 let renderSeq = 0;
 async function renderChatLog(isInitialView = false) {
-    if (!State.currentContactFp)
+    const contactFp = State.currentContactFp;
+    if (!contactFp)
         return;
     const currentSeq = ++renderSeq;
+    const generation = uiGeneration;
     const sessions = await DB.getAll('sessions');
-    const session = sessions.find(({ contactFp }) => contactFp === State.currentContactFp);
-    if (currentSeq !== renderSeq)
+    const session = sessions.find((candidate) => candidate.contactFp === contactFp);
+    if (currentSeq !== renderSeq ||
+        !Vault.isUnlocked() ||
+        generation !== uiGeneration)
         return;
     if (session)
         if (session.state === 'HANDSHAKE_SENT' ||
@@ -223,6 +275,13 @@ async function renderChatLog(isInitialView = false) {
                 UI.$('#btn-attach').disabled =
                     false;
     }
+    UI.$('#btn-start-session').disabled = Boolean(session);
+    UI.$('#chat-input').disabled =
+        session?.state !== 'ESTABLISHED';
+    UI.$('#btn-attach').disabled =
+        session?.state !== 'ESTABLISHED';
+    UI.$('#chat-form button[type=submit]').disabled =
+        session?.state !== 'ESTABLISHED';
     const query = State.searchQuery.toLowerCase();
     const highlightRegex = query
         ? new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')
@@ -293,6 +352,11 @@ async function renderChatLog(isInitialView = false) {
         emptySearch.textContent = 'No matching messages found';
         frag.appendChild(emptySearch);
     }
+    if (!Vault.isUnlocked() ||
+        generation !== uiGeneration ||
+        currentSeq !== renderSeq ||
+        contactFp !== State.currentContactFp)
+        return;
     ctn.replaceChildren(frag);
     if (isInitialView)
         ctn.scrollTop = ctn.scrollHeight;
@@ -302,46 +366,34 @@ async function renderChatLog(isInitialView = false) {
         });
 }
 UI.$('#btn-attach').onclick = () => UI.$('#media-input').click();
-let pendingMediaText = '';
-const submitChatMessage = async () => {
-    if (isSending)
+const submitChatMessage = async (mediaText, targetFp = State.currentContactFp, generation = uiGeneration, selection = selectionSeq) => {
+    if (isSending ||
+        !Vault.isUnlocked() ||
+        generation !== uiGeneration ||
+        selection !== selectionSeq ||
+        targetFp !== State.currentContactFp)
         return;
     const input = UI.$('#chat-input');
-    const text = pendingMediaText || input.value.trim();
-    pendingMediaText = '';
-    if (!text || !State.currentContactFp)
+    const text = mediaText ?? input.value.trim();
+    if (!text || !targetFp)
         return;
     isSending = true;
     input.disabled = true;
     const submitBtn = UI.$('#chat-form button[type="submit"]');
     submitBtn.disabled = true;
     try {
-        const session = await DB.get('sessions', State.currentContactFp);
-        if (!session) {
-            const { packet, session: newSession } = await CreateInit(State.currentContactFp, text);
-            await DB.put('messages', {
-                id: randomUUID(),
-                conversationId: newSession.conversationId,
-                isMe: true,
-                text,
-                timestamp: Date.now(),
-            });
-            await handleOutgoing(encodeBase64URL(packet));
-        }
-        else {
-            const packet = await EncryptMessage(session, text);
-            await DB.put('messages', {
-                id: randomUUID(),
-                conversationId: session.conversationId,
-                isMe: true,
-                text,
-                timestamp: Date.now(),
-            });
-            await handleOutgoing(encodeBase64URL(packet), session.lastRespPacket
-                ? encodeBase64URL(concatBytes(decodeBase64URL(session.lastRespPacket), packet))
-                : undefined);
-        }
-        input.value = '';
+        const { packet, session } = await EncryptMessage(targetFp, text);
+        if (!Vault.isUnlocked())
+            return;
+        const response = session.lastRespPacket
+            ? decodeBase64URL(session.lastRespPacket)
+            : undefined;
+        const bundle = response && response.length + packet.length <= Config.MAX_PACKET_SIZE
+            ? encodeBase64URL(concatBytes(response, packet))
+            : undefined;
+        await handleOutgoing(encodeBase64URL(packet), bundle);
+        if (selection === selectionSeq && generation === uiGeneration)
+            input.value = '';
     }
     catch (err) {
         UI.showToast(`Crypto Error: ${err instanceof Error && err.message ? err.message : String(err)}`);
@@ -350,22 +402,43 @@ const submitChatMessage = async () => {
     finally {
         isSending = false;
         submitBtn.disabled = false;
-        await renderChatLog();
+        if (Vault.isUnlocked())
+            await renderChatLog();
         if (!input.disabled)
             input.focus();
     }
 };
-UI.$('#media-input').onchange = (e) => {
-    const file = e.target.files?.[0];
-    if (!file)
+function sendMedia(file) {
+    const targetFp = State.currentContactFp;
+    const generation = uiGeneration;
+    const selection = selectionSeq;
+    if (!targetFp || !Vault.isUnlocked() || isSending)
         return;
+    if (file.size > 700000) {
+        UI.showToast('Media exceeds the 700 KB limit.');
+        return;
+    }
     const reader = new FileReader();
-    reader.onload = (re) => {
-        pendingMediaText = re.target?.result;
-        submitChatMessage();
+    mediaReaders.add(reader);
+    reader.onload = () => {
+        mediaReaders.delete(reader);
+        if (selection !== selectionSeq ||
+            generation !== uiGeneration ||
+            !Vault.isUnlocked())
+            return;
+        if (typeof reader.result === 'string')
+            void submitChatMessage(reader.result, targetFp, generation, selection);
         UI.$('#media-input').value = '';
     };
+    reader.onabort = reader.onerror = () => {
+        mediaReaders.delete(reader);
+    };
     reader.readAsDataURL(file);
+}
+UI.$('#media-input').onchange = (e) => {
+    const file = e.target.files?.[0];
+    if (file)
+        sendMedia(file);
 };
 UI.$('#chat-input').addEventListener('paste', (e) => {
     const items = e.clipboardData?.items;
@@ -379,12 +452,7 @@ UI.$('#chat-input').addEventListener('paste', (e) => {
             const file = item.getAsFile();
             if (!file)
                 continue;
-            const reader = new FileReader();
-            reader.onload = (re) => {
-                pendingMediaText = re.target?.result;
-                submitChatMessage();
-            };
-            reader.readAsDataURL(file);
+            sendMedia(file);
             break;
         }
 });
@@ -403,6 +471,8 @@ UI.$('#btn-add-contact').onclick = async () => {
     try {
         const text = await navigator.clipboard.readText();
         const bytes = parseEnvelope(text);
+        if (bytes.length !== 4225)
+            throw new Error('Invalid identity bundle.');
         const fp = calculateFingerprint(bytes);
         const localFp = await getLocalFingerprint();
         if (fp === localFp) {
@@ -418,6 +488,10 @@ UI.$('#btn-add-contact').onclick = async () => {
       <div class="p-4">
         <label class="block text-xs text-slate-400 mb-1">Assign Local Alias</label>
         <input type="text" id="new-alias-input" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:border-indigo-500 outline-none min-h-11 text-base sm:text-sm transition-colors" placeholder="e.g. Work Laptop" />
+        <p class="text-xs text-amber-300 mt-3">Compare this full fingerprint with your peer using a separate trusted channel. Do not trust a fingerprint sent alongside this bundle.</p>
+        <div id="new-peer-fp" class="font-mono text-xs break-all select-all my-3"></div>
+        <label class="block text-xs text-slate-400">Enter the fingerprint confirmed by your peer</label>
+        <input id="verified-fp-input" autocomplete="off" class="w-full rounded border p-2 bg-slate-950" />
       </div>
       <div class="p-4 bg-slate-900 flex justify-end gap-2 border-t border-slate-800/50">
         <button id="btn-cancel-add" class="px-4 py-2 text-sm text-slate-400 hover:text-slate-200 min-h-11 cursor-pointer transition-colors">Cancel</button>
@@ -434,19 +508,28 @@ UI.$('#btn-add-contact').onclick = async () => {
                 };
             }
         });
+        UI.$('#new-peer-fp').textContent = fp;
         UI.$('#btn-cancel-add').onclick = UI.closeModal;
         UI.$('#btn-confirm-add').onclick = async () => {
             try {
                 const name = UI.$('#new-alias-input').value.trim();
                 if (!name)
                     return;
-                await DB.put('contacts', {
-                    fingerprint: fp,
-                    bundle: encodeBase64URL(bytes),
-                    name,
-                    verified: true,
-                    archived: false,
-                    lastReadTimestamp: Date.now(),
+                if (UI.$('#verified-fp-input').value.trim() !== fp) {
+                    UI.showToast('The full fingerprint must match your independently confirmed value.');
+                    return;
+                }
+                await withStateLock(async () => {
+                    if (await DB.get('contacts', fp))
+                        throw new Error('Peer already exists.');
+                    await DB.put('contacts', {
+                        fingerprint: fp,
+                        bundle: encodeBase64URL(bytes),
+                        name,
+                        verified: true,
+                        archived: false,
+                        lastReadTimestamp: Date.now(),
+                    });
                 });
                 UI.closeModal();
                 UI.showToast('Peer linked successfully.');
@@ -522,7 +605,11 @@ UI.$('#btn-rename-contact').onclick = async () => {
         try {
             contact.name =
                 UI.$('#rename-val').value.trim() || contact.name;
-            await DB.put('contacts', contact);
+            await updateContact(contact.fingerprint, (current) => {
+                current.name = contact.name;
+            });
+            if (!Vault.isUnlocked())
+                return;
             UI.$('#chat-title').textContent = contact.name;
             UI.closeModal();
             await renderSidebar();
@@ -545,7 +632,9 @@ UI.$('#btn-archive-contact').onclick = async () => {
         UI.$('#btn-archive-contact').textContent = contact.archived
             ? 'Restore Peer'
             : 'Archive Peer';
-        await DB.put('contacts', contact);
+        await updateContact(contact.fingerprint, (current) => {
+            current.archived = contact.archived;
+        });
         UI.showToast(contact.archived ? 'Peer archived.' : 'Peer restored.');
         await renderSidebar();
     }
@@ -563,8 +652,8 @@ UI.$('#btn-delete-contact').onclick = async () => {
     UI.showModal(`
     <div class="p-4 border-b border-red-900/50 bg-red-950/30"><h3 class="font-bold text-red-400">Confirm Deletion</h3></div>
     <div class="p-4 text-sm text-slate-300">${session
-        ? 'Warning: This peer has an active channel. Deleting will permanently destroy local keys and message history.'
-        : 'This will permanently delete the peer and all associated local history.'}</div>
+        ? 'Warning: This peer has an active channel. Deleting removes all stored sessions and history for this peer. Replay protection is retained.'
+        : 'This removes the peer and all associated local history. It cannot erase copies held by the browser or other devices.'}</div>
     <div class="p-4 flex justify-end gap-2 border-t border-slate-800/50">
       <button id="btn-cancel-del" class="px-4 py-2 text-sm text-slate-400 hover:text-slate-200 min-h-11 cursor-pointer transition-colors">Cancel</button>
       <button id="btn-confirm-del" class="px-4 py-2 text-sm bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg min-h-11 cursor-pointer transition-colors shadow-sm">Delete Peer</button>
@@ -573,10 +662,7 @@ UI.$('#btn-delete-contact').onclick = async () => {
     UI.$('#btn-cancel-del').onclick = UI.closeModal;
     UI.$('#btn-confirm-del').onclick = async () => {
         try {
-            await DB.delete('contacts', targetFp);
-            await DB.delete('sessions', targetFp);
-            if (session)
-                await DB.deleteConversation(session.conversationId);
+            await DB.deletePeer(targetFp);
             UI.closeModal();
             resetChatView(true);
             UI.showToast('Peer deleted.');
@@ -598,7 +684,7 @@ UI.$('#btn-reset-session').onclick = async () => {
         return;
     UI.showModal(`
     <div class="p-4 border-b border-amber-900/50 bg-amber-950/30"><h3 class="font-bold text-amber-400">Wipe Channel State?</h3></div>
-    <div class="p-4 text-sm text-slate-300">This drops handshake keys and clears local conversation history. It does not remove the peer from your contacts.</div>
+    <div class="p-4 text-sm text-slate-300">This removes all session state and history for this peer. Your contact and replay protection are retained. Both peers must reset before starting a new handshake.</div>
     <div class="p-4 flex justify-end gap-2 border-t border-slate-800/50">
       <button id="btn-cancel-wipe" class="px-4 py-2 text-sm text-slate-400 hover:text-slate-200 min-h-11 cursor-pointer transition-colors">Cancel</button>
       <button id="btn-confirm-wipe" class="px-4 py-2 text-sm bg-amber-600 hover:bg-amber-500 text-white font-medium rounded-lg min-h-11 cursor-pointer transition-colors shadow-sm">Wipe</button>
@@ -607,8 +693,7 @@ UI.$('#btn-reset-session').onclick = async () => {
     UI.$('#btn-cancel-wipe').onclick = UI.closeModal;
     UI.$('#btn-confirm-wipe').onclick = async () => {
         try {
-            await DB.delete('sessions', targetFp);
-            await DB.deleteConversation(session.conversationId);
+            await DB.deletePeer(targetFp, false);
             UI.closeModal();
             await renderChatLog();
             UI.showToast('Channel state wiped.');
@@ -620,40 +705,35 @@ UI.$('#btn-reset-session').onclick = async () => {
     };
 };
 UI.$('#btn-global-settings').onclick = () => {
-    const cfg = Settings.get();
     UI.showModal(`
-    <div class="p-4 border-b border-slate-800"><h3 class="font-bold text-slate-200">Global Settings</h3></div>
-    <div class="p-4 space-y-4">
-      <label class="flex items-center gap-3 text-sm text-slate-300 min-h-11 cursor-pointer select-none">
-        <input type="checkbox" id="cfg-persist" class="rounded bg-slate-950 border-slate-700 text-indigo-500 w-4 h-4 focus:ring-indigo-500 transition-colors" ${cfg.persistHandshakes ? 'checked' : ''} />
-        Persist Handshake State (default)
-      </label>
-    </div>
-    <div class="p-4 flex justify-end border-t border-slate-800/50">
-      <button id="btn-save-cfg" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-medium min-h-11 cursor-pointer transition-colors shadow-sm">Save Options</button>
-    </div>
-  `);
-    UI.$('#btn-save-cfg').onclick = () => {
+    <div class="p-4 space-y-4"><h3 class="font-bold">Encrypted local vault</h3>
+      <p class="text-sm">Keys and history are encrypted with your passphrase. The vault locks after five minutes of inactivity. There is no password recovery. The clipboard and exported packets are outside the vault.</p>
+      <button id="btn-lock-vault" class="rounded bg-indigo-600 p-3">Lock now</button>
+      <button id="btn-destroy-vault" class="rounded bg-red-900 p-3">Delete all local data</button>
+    </div>`);
+    UI.$('#btn-lock-vault').onclick = () => Vault.lock();
+    UI.$('#btn-destroy-vault').onclick = async () => {
+        if (!confirm('Delete this vault, identity, all peer histories and replay protection? This cannot be undone.'))
+            return;
         try {
-            Settings.set({
-                persistHandshakes: UI.$('#cfg-persist').checked,
-            });
-            UI.closeModal();
-            UI.showToast('Settings saved successfully.');
+            await Vault.destroy();
+            await showVaultScreen();
         }
-        catch (err) {
-            UI.showToast('Failed to save settings.');
-            console.warn('[Storage] Failed to save settings:', err);
+        catch {
+            UI.showToast('Deletion failed. Close other ECP tabs and try again.');
         }
     };
 };
 async function processClipboardText(rawText) {
+    if (!Vault.isUnlocked())
+        return;
     const text = rawText.trim();
     if (!text.startsWith(Config.PREFIX)) {
         UI.showToast('Invalid ECP envelope format.');
         return;
     }
-    if (text.length > Config.MAX_PACKET_SIZE) {
+    if (text.length >
+        Math.ceil((Config.MAX_PACKET_SIZE * 4) / 3) + Config.PREFIX.length) {
         UI.showToast('Packet exceeds maximum size limits.');
         return;
     }
@@ -665,7 +745,10 @@ async function processClipboardText(rawText) {
         }
         let offset = 0;
         let sessionChanged = false;
+        let packetCount = 0;
         while (offset < bytes.length) {
+            if (++packetCount > 8)
+                throw new Error('Too many bundled packets.');
             if (bytes.length - offset < 12)
                 throw new Error('Truncated packet header.');
             const { type, payloadLength } = parseHeader(bytes.slice(offset, offset + 12));
@@ -678,21 +761,9 @@ async function processClipboardText(rawText) {
             offset += pktLen;
             try {
                 if (type === Config.PACKET_TYPES.INIT) {
-                    const { session, plaintext, respPacket } = await ProcessInit(pktBytes);
-                    await DB.put('messages', {
-                        id: randomUUID(),
-                        conversationId: session.conversationId,
-                        isMe: false,
-                        text: plaintext,
-                        timestamp: Date.now(),
-                    });
-                    if (State.currentContactFp === session.contactFp) {
-                        const contact = await DB.get('contacts', session.contactFp);
-                        if (contact) {
-                            contact.lastReadTimestamp = Date.now();
-                            await DB.put('contacts', contact);
-                        }
-                    }
+                    const { respPacket } = await ProcessInit(pktBytes);
+                    if (!Vault.isUnlocked())
+                        return;
                     UI.showToast('Handshake INIT processed.');
                     await handleOutgoing(encodeBase64URL(respPacket));
                     sessionChanged = true;
@@ -707,30 +778,19 @@ async function processClipboardText(rawText) {
                     }
                 }
                 else if (type === Config.PACKET_TYPES.MSG) {
-                    const { session, plaintext } = await DecryptMessage(pktBytes);
-                    await DB.put('messages', {
-                        id: randomUUID(),
-                        conversationId: session.conversationId,
-                        isMe: false,
-                        text: plaintext,
-                        timestamp: Date.now(),
-                    });
-                    if (State.currentContactFp === session.contactFp) {
-                        const contact = await DB.get('contacts', session.contactFp);
-                        if (contact) {
-                            contact.lastReadTimestamp = Date.now();
-                            await DB.put('contacts', contact);
-                        }
-                    }
+                    await DecryptMessage(pktBytes);
+                    if (!Vault.isUnlocked())
+                        return;
                     UI.showToast('Message decrypted.');
                     sessionChanged = true;
                 }
             }
             catch (err) {
-                console.error('[Ratchet] Individual packet error skipped:', err);
+                UI.showToast(`Packet rejected: ${err instanceof Error ? err.message : 'Invalid packet'}`);
+                break;
             }
         }
-        if (sessionChanged) {
+        if (sessionChanged && Vault.isUnlocked()) {
             await renderChatLog();
             await renderSidebar();
         }
@@ -751,6 +811,8 @@ UI.$('#btn-read').onclick = UI.$('#btn-read-clipboard').onclick = async () => {
     }
 };
 document.addEventListener('paste', async (e) => {
+    if (!Vault.isUnlocked())
+        return;
     if (['INPUT', 'TEXTAREA'].includes(e.target.tagName))
         return;
     const text = (e.clipboardData?.getData('text') ?? '').trim();
@@ -762,6 +824,8 @@ document.addEventListener('paste', async (e) => {
 async function showPeerMetadata(contactFp) {
     const session = await DB.get('sessions', contactFp);
     const contact = await DB.get('contacts', contactFp);
+    if (!Vault.isUnlocked())
+        return;
     UI.$('#metadata-title').textContent = 'Peer Diagnostics';
     UI.$('#metadata-content').innerHTML = `
     <div><strong>Peer FP:</strong> <span id="meta-fp"></span></div>
@@ -791,6 +855,8 @@ async function showPeerMetadata(contactFp) {
 UI.$('#metadata-overlay').onclick = () => UI.closeMetadata();
 UI.$('#btn-close-metadata').onclick = () => UI.closeMetadata();
 async function handleRoute() {
+    if (!Vault.isUnlocked())
+        return;
     const hash = location.hash.replace(/^#/, '').trim();
     if (!hash) {
         resetChatView(false);
@@ -802,21 +868,153 @@ async function handleRoute() {
     await selectContact(hash, true);
 }
 addEventListener('hashchange', handleRoute);
-const initApp = async () => {
+let uiGeneration = 0;
+let lockTimer;
+let newVault = true;
+let vaultScreenSeq = 0;
+async function updateContact(fp, update) {
+    return withStateLock(async () => {
+        const contact = await DB.get('contacts', fp);
+        if (!contact)
+            throw new Error('Peer was removed.');
+        update(contact);
+        await DB.put('contacts', contact);
+    });
+}
+function armAutoLock() {
+    clearTimeout(lockTimer);
+    if (Vault.isUnlocked())
+        lockTimer = setTimeout(() => Vault.lock(), 5 * 60_000);
+}
+for (const name of ['pointerdown', 'keydown'])
+    addEventListener(name, armAutoLock, { passive: true });
+addEventListener('pagehide', () => Vault.lock());
+addEventListener('ecp-vault-locked', () => {
+    uiGeneration++;
+    renderSeq++;
+    clearTimeout(lockTimer);
+    selectionSeq++;
+    cancelMediaReads();
+    delete State.currentContactFp;
+    State.searchQuery = '';
+    UI.$('#app-root').classList.add('hidden');
+    UI.$('#vault-screen').classList.remove('hidden');
+    UI.closeModal();
+    UI.closeMetadata();
+    for (const id of [
+        'chat-messages',
+        'contacts-list',
+        'my-fingerprint',
+        'metadata-content',
+        'modal-container',
+    ])
+        UI.$(`#${id}`).replaceChildren();
+    UI.$('#chat-title').textContent = 'Select a Peer';
+    UI.$('#chat-input').value = '';
+    UI.$('#chat-search-input').value = '';
+    UI.$('#media-input').value = '';
+    void showVaultScreen().catch(showStorageError);
+});
+function showStorageError() {
+    if (!Vault.isUnlocked())
+        UI.$('#vault-error').textContent =
+            'Browser storage is unavailable. Close other ECP tabs and reload.';
+}
+async function showVaultScreen() {
+    if (Vault.isUnlocked())
+        return;
+    const sequence = ++vaultScreenSeq;
+    const generation = uiGeneration;
+    UI.$('#app-root').classList.add('hidden');
+    UI.$('#vault-screen').classList.remove('hidden');
+    const status = await Vault.status();
+    const hasLegacyData = await Vault.hasLegacyData();
+    if (sequence !== vaultScreenSeq ||
+        generation !== uiGeneration ||
+        Vault.isUnlocked())
+        return;
+    newVault = status === 'new';
+    UI.$('#vault-title').textContent = newVault
+        ? 'Create your encrypted vault'
+        : 'Unlock your vault';
+    UI.$('#vault-submit').textContent = newVault ? 'Create vault' : 'Unlock';
+    UI.$('#vault-confirm-label').classList.toggle('hidden', !newVault);
+    UI.$('#vault-password').autocomplete = newVault
+        ? 'new-password'
+        : 'current-password';
+    UI.$('#legacy-notice').classList.toggle('hidden', !hasLegacyData);
+    if (!navigator.locks || !crypto.subtle) {
+        UI.$('#vault-error').textContent =
+            'Use a browser with Web Crypto and Web Locks over HTTPS or localhost.';
+        UI.$('#vault-submit').disabled = true;
+    }
+}
+UI.$('#vault-form').onsubmit = async (event) => {
+    event.preventDefault();
+    const password = UI.$('#vault-password');
+    const confirmation = UI.$('#vault-confirm');
+    const button = UI.$('#vault-submit');
+    button.disabled = true;
+    UI.$('#vault-error').textContent = '';
     try {
+        if (newVault && password.value !== confirmation.value)
+            throw new Error('Passphrases do not match.');
+        if (newVault)
+            await Vault.create(password.value);
+        else
+            await Vault.unlock(password.value);
+        password.value = '';
+        confirmation.value = '';
         await getLocalIdentity();
         await renderSidebar();
+        if (!Vault.isUnlocked())
+            throw new Error('Vault was locked. Unlock it to continue.');
+        vaultScreenSeq++;
+        UI.$('#vault-screen').classList.add('hidden');
+        UI.$('#app-root').classList.remove('hidden');
         await handleRoute();
-        console.info('[App] Initialization complete.');
+        armAutoLock();
     }
-    catch (err) {
-        UI.showToast('Application initialization failed.');
-        console.error('[App] Boot failure:', err);
+    catch (error) {
+        UI.$('#vault-error').textContent =
+            error instanceof Error && error.message
+                ? error.message
+                : 'Unable to unlock vault. Check your passphrase.';
+    }
+    finally {
+        password.value = '';
+        confirmation.value = '';
+        button.disabled = false;
     }
 };
-if (document.readyState === 'loading')
-    document.addEventListener('DOMContentLoaded', initApp);
-else
-    initApp();
-window.__showToast = UI.showToast;
+UI.$('#btn-delete-legacy').onclick = async () => {
+    if (!confirm('Delete all old ECP v1 unencrypted keys, contacts and history on this origin? There is no automatic migration or recovery.'))
+        return;
+    try {
+        await Vault.deleteLegacyData();
+        await showVaultScreen();
+    }
+    catch {
+        UI.$('#vault-error').textContent =
+            'Close old ECP tabs before deleting legacy data.';
+    }
+};
+UI.$('#btn-start-session').onclick = async () => {
+    const fp = State.currentContactFp;
+    if (!fp || !Vault.isUnlocked())
+        return;
+    const button = UI.$('#btn-start-session');
+    button.disabled = true;
+    try {
+        const { packet } = await CreateInit(fp);
+        await handleOutgoing(encodeBase64URL(packet));
+        await renderChatLog();
+    }
+    catch (error) {
+        UI.showToast(error instanceof Error ? error.message : 'Handshake failed.');
+        if (Vault.isUnlocked())
+            await renderChatLog();
+    }
+};
+void showVaultScreen().catch(showStorageError);
 //# sourceMappingURL=main.js.map
