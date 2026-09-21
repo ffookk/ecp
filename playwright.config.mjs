@@ -8,10 +8,23 @@ export default defineConfig({
   use: {
     baseURL: 'http://127.0.0.1:4173',
     headless: true,
-    launchOptions: process.env.ECP_BROWSER_PATH
-      ? { executablePath: process.env.ECP_BROWSER_PATH }
-      : {},
+    trace: 'off',
+    screenshot: 'off',
+    video: 'off',
   },
+  projects: [
+    {
+      name: 'chromium',
+      use: {
+        browserName: 'chromium',
+        launchOptions: process.env.ECP_BROWSER_PATH
+          ? { executablePath: process.env.ECP_BROWSER_PATH }
+          : {},
+      },
+    },
+    { name: 'firefox', use: { browserName: 'firefox' } },
+    { name: 'webkit', use: { browserName: 'webkit' } },
+  ],
   webServer: {
     command: 'node scripts/serve.mjs',
     url: 'http://127.0.0.1:4173',

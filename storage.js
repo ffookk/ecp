@@ -559,6 +559,10 @@ export const DB = {
     },
 };
 export const Vault = {
+    captureAccess: () => {
+        const state = snapshot();
+        return () => ensureActive(state);
+    },
     status: async () => {
         await destroying;
         const metadata = await readMetadata();

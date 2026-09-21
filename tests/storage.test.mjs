@@ -157,6 +157,19 @@ test('encrypted storage and vault security boundaries', async (t) => {
   );
 
   await t.test(
+    'access captured before lock cannot authorize work after unlocking',
+    async () => {
+      const stale = Vault.captureAccess();
+      stale();
+      Vault.lock();
+      assert.throws(stale, /locked/);
+      await Vault.unlock(passphrase);
+      assert.throws(stale, /locked/);
+      Vault.captureAccess()();
+    },
+  );
+
+  await t.test(
     'encrypts every store with independent IVs; private bytes and text do not persist',
     async () => {
       const entries = [

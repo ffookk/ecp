@@ -18,6 +18,20 @@ const stores = Object.fromEntries(['identity','contacts','sessions','messages','
 const keyOf = (s, v) => s === 'contacts' ? v.fingerprint : s === 'sessions' ? v.contactFp : v.id;
 const clone = v => v === undefined ? undefined : structuredClone(v);
 let fail = false;
+let epoch = 0;
+let unlocked = true;
+export const Vault = {
+  captureAccess() {
+    const before = epoch;
+    const check = () => {
+      if (!unlocked || before !== epoch) throw new Error('Vault is locked or changed');
+    };
+    check();
+    return check;
+  },
+  lock() { unlocked = false; epoch++; },
+  unlock() { unlocked = true; epoch++; },
+};
 export const DB = {
   async get(s, k) { await Promise.resolve(); return clone(stores[s].get(k)); },
   async getAll(s) { return [...stores[s].values()].map(clone); },
@@ -32,6 +46,12 @@ export const DB = {
   async delete(s, k) { stores[s].delete(k); },
   failNextCommit() { fail = true; },
   snapshot() { return clone(Object.fromEntries(Object.entries(stores).map(([s,m]) => [s,[...m.entries()]]))); },
+  restore(snapshot) {
+    for (const [s, entries] of Object.entries(clone(snapshot))) {
+      stores[s].clear();
+      for (const [key, value] of entries) stores[s].set(key, value);
+    }
+  },
 };
 `;
 
@@ -56,7 +76,7 @@ export async function createProtocolLab(t) {
     'dir',
   );
   let count = 0;
-  async function peer() {
+  async function peer(snapshot) {
     const directory = join(sandbox, `peer-${count++}`);
     await mkdir(directory);
     for (const name of [
@@ -89,6 +109,7 @@ export async function createProtocolLab(t) {
           'config',
         ].map(load),
       );
+    if (snapshot) storage.DB.restore(snapshot);
     const local = await identity.getLocalIdentity();
     const publicBytes = identity.serializeIdentityPublic(local);
     return {

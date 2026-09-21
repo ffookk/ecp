@@ -1,29 +1,35 @@
 import { Config } from './config.js';
 import { concatBytes, keygenEd25519, keygenMLDSA87, keygenX25519, keygenMLKEM1024, sha256, encodeBase64URL, } from './crypto.js';
 import { withNamedLock } from './locks.js';
-import { DB } from './storage.js';
-export const getLocalIdentity = async () => withNamedLock('identity', async () => {
-    let id = await DB.get('identity', 'local');
-    if (!id) {
-        const ecKP = keygenEd25519();
-        const dsaKP = keygenMLDSA87();
-        const dhKP = keygenX25519();
-        const kemKP = keygenMLKEM1024();
-        id = {
-            id: 'local',
-            ecSk: ecKP.secretKey,
-            ecPk: ecKP.publicKey,
-            dsaSk: dsaKP.secretKey,
-            dsaPk: dsaKP.publicKey,
-            dhSk: dhKP.secretKey,
-            dhPk: dhKP.publicKey,
-            kemSk: kemKP.secretKey,
-            kemPk: kemKP.publicKey,
-        };
-        await DB.put('identity', id);
-    }
-    return id;
-});
+import { DB, Vault } from './storage.js';
+export const getLocalIdentity = async () => {
+    const assertAccess = Vault.captureAccess();
+    return withNamedLock('identity', async () => {
+        assertAccess();
+        let id = await DB.get('identity', 'local');
+        assertAccess();
+        if (!id) {
+            const ecKP = keygenEd25519();
+            const dsaKP = keygenMLDSA87();
+            const dhKP = keygenX25519();
+            const kemKP = keygenMLKEM1024();
+            id = {
+                id: 'local',
+                ecSk: ecKP.secretKey,
+                ecPk: ecKP.publicKey,
+                dsaSk: dsaKP.secretKey,
+                dsaPk: dsaKP.publicKey,
+                dhSk: dhKP.secretKey,
+                dhPk: dhKP.publicKey,
+                kemSk: kemKP.secretKey,
+                kemPk: kemKP.publicKey,
+            };
+            await DB.put('identity', id);
+            assertAccess();
+        }
+        return id;
+    });
+};
 export const serializeIdentityPublic = (id) => concatBytes(new Uint8Array([Config.IDENTITY_VERSION]), id.ecPk, id.dsaPk, id.dhPk, id.kemPk);
 export const parseIdentityPublic = (bytes) => {
     if (bytes.length !== 4225)

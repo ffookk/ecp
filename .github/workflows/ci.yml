@@ -11,24 +11,43 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
           cache: npm
+      - name: Check index, reachable history and publication metadata
+        run: node scripts/privacy-check.mjs
       - run: npm ci --ignore-scripts
+      - name: Reject known high and critical runtime or build dependency vulnerabilities
+        run: npm audit --audit-level=high
       - run: npm run check
-      - name: Check committed browser assets
-        run: git diff --exit-code
-      - run: npx playwright install --with-deps chromium
-      - run: npx playwright test
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Verify regenerated assets match the committed source tree exactly
+        shell: bash
+        run: |
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "Regenerated assets differ from committed files; refusing to package."
+            exit 1
+          fi
+          if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+            echo "Unexpected untracked build output; refusing to package."
+            exit 1
+          fi
+      - run: npx playwright install --with-deps chromium firefox webkit
+      - name: Test Chromium, Firefox and WebKit without collecting private artifacts
+        run: npx playwright test
+      - name: Prepare the offline local client package
+        run: node scripts/package.mjs
+      - name: Upload only the explicit static client package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: experimental-static-client
-          path: dist/
+          name: experimental-static-package
+          path: build-package/
           if-no-files-found: error
           retention-days: 14
+          include-hidden-files: false
