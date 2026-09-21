@@ -9,8 +9,8 @@ import {
 test('control-only handshake, exact RESP duplicates and several multi-message DH turns', async (t) => {
   const { pair } = await createProtocolLab(t);
   const { a, b, init, response } = await pair();
-  assert.equal(init.packet.length, 14769);
-  assert.equal(response.respPacket.length, 3196);
+  assert.equal(init.packet.length, 14781);
+  assert.equal(response.respPacket.length, 3208);
   assert.equal((await a.DB.getAll('messages')).length, 0);
   assert.equal((await b.DB.getAll('messages')).length, 0);
   await assert.rejects(a.CreateInit(b.fingerprint), /existing channel/);
@@ -218,7 +218,7 @@ test('authenticated transcript replay survives reset and randomized re-signing',
   const alternate = init.packet.slice();
   const c = a.cryptography;
   const signed = c.concatBytes(
-    a.codec.encodeUTF8('ECP-INIT-v2'),
+    a.codec.encodeUTF8('ECP-INIT-v3'),
     alternate.slice(12, 10062),
   );
   alternate.set(c.signComposite(signed, a.local.ecSk, a.local.dsaSk), 10062);
@@ -365,4 +365,294 @@ test('locked reset cannot be followed by a stale protocol history write', async 
     a.EncryptMessage(b.fingerprint, 'after reset'),
     /established channel/,
   );
+});
+
+test('cloned and restored sending positions use fresh packet nonces and authenticate independently', async (t) => {
+  const { pair, peer } = await createProtocolLab(t);
+  const { a, b } = await pair();
+  // The first initiator send creates a fresh DH chain. Clone only after it,
+  // otherwise randomized DH keys would mask reuse of an existing position.
+  await b.DecryptMessage(
+    (await a.EncryptMessage(b.fingerprint, 'warmup')).packet,
+  );
+  const senderSnapshot = a.DB.snapshot(),
+    receiverSnapshot = b.DB.snapshot();
+  const fork = await peer(senderSnapshot),
+    receiverFork = await peer(receiverSnapshot);
+  const originalSession = await a.DB.get('sessions', b.fingerprint);
+  assert.deepEqual(
+    (await fork.DB.get('sessions', b.fingerprint)).CKs,
+    originalSession.CKs,
+  );
+  const leftText = 'synthetic branch A',
+    rightText = 'synthetic branch B';
+  const left = (await a.EncryptMessage(b.fingerprint, leftText)).packet;
+  const right = (await fork.EncryptMessage(b.fingerprint, rightText)).packet;
+  assert.equal(sequence(left), sequence(right));
+  assert.deepEqual(left.slice(0, 3204), right.slice(0, 3204));
+  assert.notDeepEqual(left.slice(3204, 3216), right.slice(3204, 3216));
+  // Derive the shared pre-fork message key and verify both sealed payloads.
+  const c = a.cryptography;
+  const mk = c.hmacSHA256(originalSession.CKs, new Uint8Array([1]));
+  const key = c.hkdfSHA256(
+    mk,
+    new Uint8Array(32),
+    a.codec.encodeUTF8('ECP-AES256GCMSIV-v3'),
+    32,
+  );
+  const aad = c.concatBytes(
+    a.codec.encodeUTF8('ECP-MSG-v3'),
+    left.slice(12, 28),
+    a.publicBytes,
+    b.publicBytes,
+    left.slice(12, 3204),
+  );
+  assert.equal(
+    a.codec.decodeUTF8(c.decryptPacket(key, left.slice(3204), aad)),
+    leftText,
+  );
+  assert.equal(
+    a.codec.decodeUTF8(c.decryptPacket(key, right.slice(3204), aad)),
+    rightText,
+  );
+  assert.equal((await b.DecryptMessage(left)).plaintext, leftText);
+  assert.equal((await receiverFork.DecryptMessage(right)).plaintext, rightText);
+  const consumed = b.DB.snapshot();
+  await assert.rejects(b.DecryptMessage(right), /replayed|out of order/);
+  assert.deepEqual(b.DB.snapshot(), consumed);
+
+  a.DB.restore(senderSnapshot);
+  const restored = (await a.EncryptMessage(b.fingerprint, leftText)).packet;
+  assert.equal(sequence(restored), sequence(left));
+  assert.notDeepEqual(restored.slice(3204, 3216), left.slice(3204, 3216));
+  b.DB.restore(receiverSnapshot);
+  assert.equal((await b.DecryptMessage(restored)).plaintext, leftText);
+});
+
+test('all packet types authenticate their transmitted nonce before changing storage', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  const { a, b } = await pair(false);
+  const init = await a.CreateInit(b.fingerprint);
+  let before = b.DB.snapshot();
+  await assert.rejects(
+    b.ProcessInit(
+      changed(init.packet, (p) => {
+        p[14753] ^= 1;
+      }),
+    ),
+  );
+  assert.deepEqual(b.DB.snapshot(), before);
+  const response = await b.ProcessInit(init.packet);
+  before = a.DB.snapshot();
+  await assert.rejects(
+    a.ProcessResp(
+      changed(response.respPacket, (p) => {
+        p[12] ^= 1;
+      }),
+    ),
+  );
+  assert.deepEqual(a.DB.snapshot(), before);
+  await a.ProcessResp(response.respPacket);
+  const first = (await a.EncryptMessage(b.fingerprint, 'first')).packet;
+  const second = (await a.EncryptMessage(b.fingerprint, 'second')).packet;
+  before = b.DB.snapshot();
+  await assert.rejects(
+    b.DecryptMessage(
+      changed(second, (p) => {
+        p[3204] ^= 1;
+      }),
+    ),
+  );
+  assert.deepEqual(b.DB.snapshot(), before);
+  await b.DecryptMessage(second);
+  before = b.DB.snapshot();
+  await assert.rejects(
+    b.DecryptMessage(
+      changed(first, (p) => {
+        p[3204] ^= 1;
+      }),
+    ),
+  );
+  assert.deepEqual(b.DB.snapshot(), before);
+  assert.equal((await b.DecryptMessage(first)).plaintext, 'first');
+});
+
+test('a restored pre-INIT receiver uses a fresh RESP nonce under the same handshake key', async (t) => {
+  const { pair, peer } = await createProtocolLab(t);
+  const { a, b } = await pair(false);
+  const { packet } = await a.CreateInit(b.fingerprint);
+  const pending = await a.DB.get('sessions', b.fingerprint);
+  const initiatorFork = await peer(a.DB.snapshot());
+  const receiverFork = await peer(b.DB.snapshot());
+  const left = (await b.ProcessInit(packet)).respPacket;
+  const right = (await receiverFork.ProcessInit(packet)).respPacket;
+  assert.deepEqual(left.slice(0, 12), right.slice(0, 12));
+  assert.notDeepEqual(left.slice(12, 24), right.slice(12, 24));
+  const key = a.cryptography.hkdfSHA256(
+    pending.SK,
+    new Uint8Array(32),
+    a.codec.encodeUTF8('ECP-RESP-v3'),
+    32,
+  );
+  for (const response of [left, right])
+    assert.equal(
+      a.cryptography.decryptPacket(
+        key,
+        response.slice(12),
+        response.slice(0, 12),
+      ).length,
+      3168,
+    );
+  await a.ProcessResp(left);
+  await initiatorFork.ProcessResp(right);
+  assert.equal(
+    (
+      await b.DecryptMessage(
+        (await a.EncryptMessage(b.fingerprint, 'left branch')).packet,
+      )
+    ).plaintext,
+    'left branch',
+  );
+  assert.equal(
+    (
+      await receiverFork.DecryptMessage(
+        (await initiatorFork.EncryptMessage(b.fingerprint, 'right branch'))
+          .packet,
+      )
+    ).plaintext,
+    'right branch',
+  );
+});
+
+test('v2 wire framing and stored sessions fail closed without migration', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  const { a, b, init, response } = await pair();
+  const message = (await a.EncryptMessage(b.fingerprint, 'current')).packet;
+  for (const [target, process, packet] of [
+    [b, 'ProcessInit', init.packet],
+    [a, 'ProcessResp', response.respPacket],
+    [b, 'DecryptMessage', message],
+  ]) {
+    const before = target.DB.snapshot();
+    await assert.rejects(
+      target[process](
+        changed(packet, (p) => {
+          p[4] = 2;
+        }),
+      ),
+      /version/,
+    );
+    await assert.rejects(
+      target[process](
+        changed(packet, (p) => {
+          p[3] = 0x32;
+          p[4] = 2;
+        }),
+      ),
+      /magic/,
+    );
+    assert.deepEqual(target.DB.snapshot(), before);
+  }
+  assert.throws(() => a.codec.parseEnvelope('e2e2:AAAA'), /format/);
+  const old = await a.DB.get('sessions', b.fingerprint);
+  old.version = 2;
+  await a.DB.put('sessions', old);
+  const before = a.DB.snapshot();
+  await assert.rejects(
+    a.EncryptMessage(b.fingerprint, 'must reject'),
+    /stored protocol version/,
+  );
+  assert.deepEqual(a.DB.snapshot(), before);
+});
+
+test('RNG failure releases no send result and commits no chain state or history', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  const { a, b } = await pair();
+  await b.DecryptMessage(
+    (await a.EncryptMessage(b.fingerprint, 'warmup')).packet,
+  );
+  const before = a.DB.snapshot();
+  const mock = t.mock.method(crypto, 'getRandomValues', () => {
+    throw new Error('RNG unavailable');
+  });
+  await assert.rejects(
+    a.EncryptMessage(b.fingerprint, 'must not send'),
+    /RNG unavailable/,
+  );
+  assert.deepEqual(a.DB.snapshot(), before);
+  mock.mock.restore();
+  assert.equal(
+    (
+      await b.DecryptMessage(
+        (await a.EncryptMessage(b.fingerprint, 'recovered')).packet,
+      )
+    ).plaintext,
+    'recovered',
+  );
+});
+
+test('queued protocol work cannot resume after a vault lock/unlock cycle', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  for (const kind of ['create', 'init', 'resp', 'send', 'receive']) {
+    const { a, b } = await pair(kind === 'send' || kind === 'receive');
+    let target = a,
+      action;
+    if (kind === 'create') action = () => a.CreateInit(b.fingerprint);
+    if (kind === 'init' || kind === 'resp') {
+      const init = await a.CreateInit(b.fingerprint);
+      if (kind === 'init') {
+        target = b;
+        action = () => b.ProcessInit(init.packet);
+      } else {
+        const response = await b.ProcessInit(init.packet);
+        action = () => a.ProcessResp(response.respPacket);
+      }
+    }
+    if (kind === 'send')
+      action = () => a.EncryptMessage(b.fingerprint, 'stale send');
+    if (kind === 'receive') {
+      const message = await b.EncryptMessage(a.fingerprint, 'stale receive');
+      action = () => a.DecryptMessage(message.packet);
+    }
+    const before = target.DB.snapshot();
+    let release, entered;
+    const started = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const held = target.withStateLock(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+          entered();
+        }),
+    );
+    await started;
+    const rejected = assert.rejects(action(), /locked|changed/);
+    target.Vault.lock();
+    target.Vault.unlock();
+    release();
+    await held;
+    await rejected;
+    assert.deepEqual(target.DB.snapshot(), before, kind);
+  }
+});
+
+test('vault invalidation during a protocol read cannot become a later-generation write', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  const { a, b } = await pair();
+  const before = a.DB.snapshot();
+  const get = a.DB.get;
+  t.mock.method(a.DB, 'get', async (store, key) => {
+    const value = await get.call(a.DB, store, key);
+    if (store === 'sessions') {
+      a.Vault.lock();
+      a.Vault.unlock();
+    }
+    return value;
+  });
+  await assert.rejects(
+    a.EncryptMessage(b.fingerprint, 'stale operation'),
+    /locked|changed/,
+  );
+  assert.deepEqual(a.DB.snapshot(), before);
 });

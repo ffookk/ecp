@@ -2,6 +2,25 @@
 
 Changes below describe this experimental fork of [jamesliu96/ecp](https://github.com/jamesliu96/ecp). They do not describe an upstream release or an independent security certification.
 
+## 1.2.0 — Unreleased
+
+### Wire v3 and snapshot misuse resistance
+
+- Replace deterministic AES-GCM wire nonces with internally generated random 96-bit nonces and AES-256-GCM-SIV. Synthetic restoration of an established v2 sending chain reproduced repeated key/nonce use and ciphertext-XOR disclosure; the v3 regression tests both restored and forked senders.
+- Introduce incompatible `e2e3:` / `E2E3` framing, wire version 3 and v3 KDF/transcript domains. Reject v2 wire packets; keep the v2 encrypted-vault schema, identity format and fingerprint domain unchanged.
+- Disable sending on stored v2 channels and require an explicit channel reset on both peers. The reset deletes that peer's local history; installing the upgrade does not delete it automatically.
+- Add RFC 8452 AES-256-GCM-SIV known-answer vectors, strict nonce/ciphertext/AAD tamper tests, RNG-failure checks and snapshot regressions. This mitigates nonce misuse, not snapshot rollback, forked histories or erased replay protection.
+
+### Operation lifetime and delivery
+
+- Capture vault access before protocol and identity operations enter a lock queue; reject work crossing a lock/unlock cycle, including a cycle completed before the queue resumes.
+- Bind peer import, alias editing, metadata and clipboard completions to their initiating UI state. Invalidate stale modals and prevent a delayed alias operation from changing another peer's visible title.
+- Add real-browser regressions for delayed operations and protocol upgrade handling; run the suite in Chromium, Firefox and WebKit in CI.
+- Initialize modal focus synchronously so delayed animation frames cannot redirect fingerprint entry. Disable vault form input while deletion, durable status loading or a submission is pending.
+- Add an offline runnable package with a loopback server and checksum manifests; restrict CI artifacts to the intended package. No automatic deployment is added.
+- Add a publication privacy gate for staged files, reachable history and commit metadata, with synthetic regression fixtures generated outside the checkout.
+- Document protocol framing, derivation, snapshot limitations and remaining independent-review requirements. Experimental status is retained.
+
 ## 1.1.0 — Unreleased
 
 ### Breaking changes

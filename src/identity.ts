@@ -9,12 +9,15 @@ import {
   encodeBase64URL,
 } from './crypto.js';
 import { withNamedLock } from './locks.js';
-import { DB } from './storage.js';
+import { DB, Vault } from './storage.js';
 import type { Identity } from './types.js';
 
-export const getLocalIdentity = async () =>
-  withNamedLock('identity', async () => {
+export const getLocalIdentity = async () => {
+  const assertAccess = Vault.captureAccess();
+  return withNamedLock('identity', async () => {
+    assertAccess();
     let id = await DB.get('identity', 'local');
+    assertAccess();
 
     if (!id) {
       const ecKP = keygenEd25519();
@@ -34,9 +37,11 @@ export const getLocalIdentity = async () =>
         kemPk: kemKP.publicKey,
       };
       await DB.put('identity', id);
+      assertAccess();
     }
     return id;
   });
+};
 
 export const serializeIdentityPublic = (id: Identity) =>
   concatBytes(

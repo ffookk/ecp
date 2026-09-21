@@ -735,6 +735,10 @@ export const DB = {
 };
 
 export const Vault = {
+  captureAccess: (): (() => void) => {
+    const state = snapshot();
+    return () => ensureActive(state);
+  },
   status: async (): Promise<'new' | 'locked' | 'unlocked'> => {
     // A lock-event UI refresh must not reopen a database while its deletion is
     // still waiting for other connections to close.

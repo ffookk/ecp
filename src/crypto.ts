@@ -1,7 +1,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hmac } from '@noble/hashes/hmac.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
-import { gcm } from '@noble/ciphers/aes.js';
+import { gcmsiv } from '@noble/ciphers/aes.js';
 import { ed25519, x25519 } from '@noble/curves/ed25519.js';
 import { ml_dsa87 } from '@noble/post-quantum/ml-dsa.js';
 import { ml_kem1024 } from '@noble/post-quantum/ml-kem.js';
@@ -97,19 +97,63 @@ export const hkdfSHA256 = (
   length: number,
 ) => hkdf(sha256, ikm, salt, info, length);
 
-export const encryptGCM = (
+const PACKET_NONCE_SIZE = 12;
+export const PACKET_AEAD_OVERHEAD = PACKET_NONCE_SIZE + 16;
+
+const requirePacketKey = (key: Uint8Array) => {
+  if (key.length !== 32)
+    throw new Error('AES-256-GCM-SIV requires a 32-byte key.');
+};
+
+// Explicit primitives also allow verification against RFC 8452 test vectors.
+export const encryptGCMSIV = (
   key: Uint8Array,
   nonce: Uint8Array,
   plaintext: Uint8Array,
   aad: Uint8Array,
-) => gcm(key, nonce, aad).encrypt(plaintext);
+) => {
+  requirePacketKey(key);
+  return gcmsiv(key, nonce, aad).encrypt(plaintext);
+};
 
-export const decryptGCM = (
+export const decryptGCMSIV = (
   key: Uint8Array,
   nonce: Uint8Array,
   ciphertext: Uint8Array,
   aad: Uint8Array,
-) => gcm(key, nonce, aad).decrypt(ciphertext);
+) => {
+  requirePacketKey(key);
+  return gcmsiv(key, nonce, aad).decrypt(ciphertext);
+};
+
+// All wire encryption owns its randomness here. A restored chain position must
+// not also restore a deterministic nonce. GCM-SIV limits damage if randomness
+// nevertheless repeats; neither property establishes storage freshness.
+export const encryptPacket = (
+  key: Uint8Array,
+  plaintext: Uint8Array,
+  aad: Uint8Array,
+) => {
+  requirePacketKey(key);
+  const nonce = getRandomBytes(PACKET_NONCE_SIZE);
+  return concatBytes(nonce, encryptGCMSIV(key, nonce, plaintext, aad));
+};
+
+export const decryptPacket = (
+  key: Uint8Array,
+  sealed: Uint8Array,
+  aad: Uint8Array,
+) => {
+  requirePacketKey(key);
+  if (sealed.length < PACKET_AEAD_OVERHEAD)
+    throw new Error('Truncated authenticated packet.');
+  return decryptGCMSIV(
+    key,
+    sealed.subarray(0, PACKET_NONCE_SIZE),
+    sealed.subarray(PACKET_NONCE_SIZE),
+    aad,
+  );
+};
 
 export const keygenEd25519 = ed25519.keygen;
 

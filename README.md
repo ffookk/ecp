@@ -6,11 +6,11 @@ A security-focused fork of [James Liu's E2EE Clipboard Protocol](https://github.
 
 ## Compatibility and current status
 
-- This fork uses the incompatible **v2** wire format: `e2e2:` envelopes, `E2E2` packet magic, and protocol version `2`.
-- It creates a fresh identity in a new encrypted browser database. It does not import v1 identities, sessions, or history. Both participants must use this version and exchange and verify their new fingerprints.
+- This fork uses the incompatible **v3** wire format: `e2e3:` envelopes, `E2E3` packet magic, and protocol version `3`.
+- Existing v2 encrypted vaults, identities and verified contacts are retained. Identity fingerprints do not change. Existing v2 channels cannot send or accept v3 packets: upgrade both participants, then explicitly use **Wipe Channel State** on both sides before a new handshake. Wiping deletes that peer's local history; the upgrade itself does not. v1 plaintext identities and history are never imported automatically.
 - There is no built-in backup, export/import, passphrase change, or recovery mechanism. Losing the passphrase, clearing browser storage, losing the browser profile, or browser storage eviction can permanently lose the identity and history.
-- Do not clone or restore an active session database. Restoring or simultaneously using copies can repeat ratchet state, including encryption keys and nonces. Use fresh identities and newly verified channels after a profile restore; vault encryption cannot establish the freshness of an entire valid database snapshot.
-- The implementation remains subject to independent protocol review, broader browser testing, and further hardening. The software and tests are not a security certification.
+- Do not clone or restore an active session database. Restoring or simultaneously using copies can repeat ratchet keys, counters and replay history. Random wire nonces and AES-256-GCM-SIV mitigate nonce-reuse damage but do not authenticate snapshot freshness or make cloning safe. Use fresh identities and newly verified channels after a profile restore; vault encryption cannot establish the freshness of an entire valid database snapshot.
+- The implementation remains subject to independent protocol review and further hardening. The software and tests are not a security certification.
 
 ## Run a local build
 
@@ -24,11 +24,25 @@ npm run check
 npm run dev
 ```
 
-Open [the local app](http://127.0.0.1:4173). `npm run check` runs TypeScript checking, Node tests, and a production build. `npm run dev` serves the existing `dist/` directory at `127.0.0.1:4173`; it is not a build watcher. After changing source files, build again with `npm run build` and reload the page.
+Open [the local app](http://127.0.0.1:4173). `npm run check` runs TypeScript checking, a production build, and Node tests against the resulting code. `npm run dev` serves the existing `dist/` directory at `127.0.0.1:4173`; it is not a build watcher. After changing source files, build again with `npm run build` and reload the page.
 
 The build copies pinned Noble dependencies from the lockfile into local browser assets and writes `dist/SHA256SUMS.json`. These hashes help compare build artifacts; they are not a signed release attestation and do not authenticate a compromised build machine or hosting origin. Installing dependencies and running builds still requires trust in the selected source, package registry, lockfile, and local tooling.
 
 **Building and testing do not publish anything.** There is no automatic GitHub Pages deployment. Review any hosting decision separately and serve only the intended built artifacts.
+
+## Package for local use
+
+```sh
+npm run package
+cd build-package
+node scripts/serve.mjs
+```
+
+The package contains the static application, a Node-only loopback server, usage notes and checksum manifests. No npm installation or runtime network dependency is needed to run the generated package. Keep the same local origin and browser profile to access an existing vault; changing the port or origin creates a separate storage scope. This is not a vault backup.
+
+CI uploads the explicit `build-package/` directory after its checks. It does not upload browser profiles, clipboard contents, test traces or the whole workspace, and it does not deploy the app. Checksums detect changes only relative to a trusted manifest; they are not a publisher signature.
+
+Before publishing, stage only intended project files and run `npm run privacy:check`. This checks the staged index, reachable Git history and commit metadata for common secret/path patterns and unintended files. New commit email addresses must use GitHub's noreply form; reviewed upstream history retains its original public authors. Pattern checks can miss unknown secret formats and cannot anonymize a public GitHub account.
 
 ## Exchange a message
 
@@ -64,17 +78,19 @@ All deletion operations remove logical browser database records. They do not pro
 
 ## Protocol implementation
 
-The custom v2 protocol combines X25519, ML-KEM-1024, composite Ed25519 + ML-DSA-87 signatures, HKDF/HMAC-SHA-256 and AES-256-GCM. These are implemented through pinned Noble libraries; using established primitives does not establish the security of their composition here.
+The custom v3 protocol combines X25519, ML-KEM-1024, composite Ed25519 + ML-DSA-87 signatures, HKDF/HMAC-SHA-256 and AES-256-GCM-SIV for wire packets. The encrypted vault continues to use Web Crypto AES-256-GCM with independently random IVs. The wire primitives are implemented through pinned Noble libraries; using established primitives does not establish the security of their composition here.
 
 The current implementation adds:
 
+- Fresh random 96-bit nonces inside a shared AES-256-GCM-SIV packet wrapper; nonce generation failures abort without a weaker fallback.
 - A control-only authenticated INIT and explicit response processing before the initiator sends content.
 - Verified-contact checks, exact packet framing, strict version handling, and size/counter limits.
 - An origin-wide Web Lock spanning each protocol read, cryptographic transition, and committed write. There is no weaker per-tab fallback.
+- An access guard captured before queuing that invalidates protocol and identity operations across every lock/unlock cycle.
 - Atomic encrypted batches for ratchet changes and message history, and for accepted handshakes and their replay records.
 - Transcript-based handshake replay tracking, exact accepted-RESP duplicate matching, and bounded out-of-order message handling.
 
-The wire layout, key schedule and state transitions are implemented in [src/codec.ts](src/codec.ts), [src/ratchet.ts](src/ratchet.ts), and [src/crypto.ts](src/crypto.ts). This README is not a complete interoperability specification. Do not reuse the protocol as a cryptographic standard without separate design and implementation review.
+The wire layout, key schedule and state transitions are implemented in [src/codec.ts](src/codec.ts), [src/ratchet.ts](src/ratchet.ts), and [src/crypto.ts](src/crypto.ts). The [v3 protocol review notes](docs/PROTOCOL.md) describe framing, key derivation and state boundaries for external review. Do not reuse the protocol as a cryptographic standard without separate design and implementation review.
 
 No blanket forward-secrecy, post-compromise recovery, quantum-security, anonymity, or non-repudiation guarantee is made. In particular, plaintext message history is retained inside the vault: an adversary who obtains the unlocked vault or its passphrase can read that retained history regardless of transport-key deletion.
 
@@ -96,14 +112,14 @@ npm run check
 
 Node regression tests exercise real protocol cryptography with isolated storage/lock adapters and exercise encrypted vault behavior with a test IndexedDB implementation. They cover multi-message ratchet turns, reordered and replayed packets, tampering, counter bounds, concurrent operations, transaction failures, vault locking and deletion. They do not constitute a cryptographic proof or exhaustive browser/OS coverage.
 
-For the browser integration suite, install Playwright's Chromium and run:
+For the browser integration suite, install the three Playwright engines and run:
 
 ```sh
-npx playwright install chromium
+npx playwright install chromium firefox webkit
 npm run test:browser
 ```
 
-On Linux, Playwright may also require its documented browser system dependencies. A locally installed compatible browser can be selected with the `ECP_BROWSER_PATH` environment variable. The suite builds the app, starts its own server on port 4173, and uses isolated browser contexts and a synthetic page-local clipboard. Stop any development server on that port first. It covers the visible vault/contact/handshake/message flow, wrong-passphrase handling, and concurrent operations from real tabs sharing one origin. Synthetic clipboard tests do not validate OS clipboard permissions or clipboard-history behavior.
+On Linux, Playwright may also require its documented browser system dependencies. A locally installed compatible Chromium browser can be selected with `ECP_BROWSER_PATH`; use `npm run test:browser -- --project=chromium` for only that engine. The override never replaces Firefox or WebKit. The suite builds the app, starts its own server on port 4173, and uses isolated browser contexts and a synthetic page-local clipboard. Stop any development server on that port first. It covers the visible vault/contact/handshake/message flow, wrong-passphrase handling, concurrent operations from real tabs sharing one origin, old-channel upgrade handling, and delayed operations across peer selection or vault lock/unlock. CI runs Chromium, Firefox and WebKit separately. Synthetic clipboard tests do not validate OS clipboard permissions or clipboard-history behavior.
 
 ## Attribution and license
 

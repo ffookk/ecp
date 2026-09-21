@@ -1,7 +1,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hmac } from '@noble/hashes/hmac.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
-import { gcm } from '@noble/ciphers/aes.js';
+import { gcmsiv } from '@noble/ciphers/aes.js';
 import { ed25519, x25519 } from '@noble/curves/ed25519.js';
 import { ml_dsa87 } from '@noble/post-quantum/ml-dsa.js';
 import { ml_kem1024 } from '@noble/post-quantum/ml-kem.js';
@@ -62,8 +62,31 @@ export const constantTimeCompare = (a, b) => {
 export { sha256 };
 export const hmacSHA256 = (keyBytes, msgBytes) => hmac(sha256, keyBytes, msgBytes);
 export const hkdfSHA256 = (ikm, salt, info, length) => hkdf(sha256, ikm, salt, info, length);
-export const encryptGCM = (key, nonce, plaintext, aad) => gcm(key, nonce, aad).encrypt(plaintext);
-export const decryptGCM = (key, nonce, ciphertext, aad) => gcm(key, nonce, aad).decrypt(ciphertext);
+const PACKET_NONCE_SIZE = 12;
+export const PACKET_AEAD_OVERHEAD = PACKET_NONCE_SIZE + 16;
+const requirePacketKey = (key) => {
+    if (key.length !== 32)
+        throw new Error('AES-256-GCM-SIV requires a 32-byte key.');
+};
+export const encryptGCMSIV = (key, nonce, plaintext, aad) => {
+    requirePacketKey(key);
+    return gcmsiv(key, nonce, aad).encrypt(plaintext);
+};
+export const decryptGCMSIV = (key, nonce, ciphertext, aad) => {
+    requirePacketKey(key);
+    return gcmsiv(key, nonce, aad).decrypt(ciphertext);
+};
+export const encryptPacket = (key, plaintext, aad) => {
+    requirePacketKey(key);
+    const nonce = getRandomBytes(PACKET_NONCE_SIZE);
+    return concatBytes(nonce, encryptGCMSIV(key, nonce, plaintext, aad));
+};
+export const decryptPacket = (key, sealed, aad) => {
+    requirePacketKey(key);
+    if (sealed.length < PACKET_AEAD_OVERHEAD)
+        throw new Error('Truncated authenticated packet.');
+    return decryptGCMSIV(key, sealed.subarray(0, PACKET_NONCE_SIZE), sealed.subarray(PACKET_NONCE_SIZE), aad);
+};
 export const keygenEd25519 = ed25519.keygen;
 export const keygenMLDSA87 = ml_dsa87.keygen;
 export const signComposite = (message, ecSk, dsaSk) => concatBytes(ed25519.sign(message, ecSk), ml_dsa87.sign(message, dsaSk));
