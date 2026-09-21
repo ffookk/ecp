@@ -389,3 +389,93 @@ test('identity creation queued before lock cannot create keys after a later unlo
     freshCreated: true,
   });
 });
+
+test('deferred modal autofocus cannot redirect fingerprint entry to the alias input', async ({
+  page,
+}) => {
+  await openVault(page);
+  const peer = await syntheticIdentity(page);
+  await page.evaluate((value) => {
+    window.testClipboard = value;
+    window.savedRequestAnimationFrame = window.requestAnimationFrame;
+    window.deferredFrames = [];
+    window.requestAnimationFrame = (callback) => {
+      window.deferredFrames.push(callback);
+      return window.deferredFrames.length;
+    };
+  }, peer.envelope);
+  await page.locator('#btn-add-contact').click();
+  await page.locator('#new-alias-input').fill('Synthetic delayed-focus peer');
+  await page.evaluate(() => {
+    // Firefox/Playwright focus and text insertion are separate operations.
+    // Release the application's delayed frame precisely as entry moves to
+    // the fingerprint input, rather than depending on background-tab timing.
+    document.querySelector('#verified-fp-input').addEventListener(
+      'focus',
+      () => {
+        queueMicrotask(() => {
+          window.requestAnimationFrame = window.savedRequestAnimationFrame;
+          for (const callback of window.deferredFrames.splice(0))
+            callback(performance.now());
+        });
+      },
+      { once: true },
+    );
+  });
+  await page.locator('#verified-fp-input').fill(peer.fingerprint);
+  await expect(page.locator('#verified-fp-input')).toBeFocused();
+  await expect(page.locator('#verified-fp-input')).toHaveValue(
+    peer.fingerprint,
+  );
+  await expect(page.locator('#new-alias-input')).toHaveValue(
+    'Synthetic delayed-focus peer',
+  );
+  await page.locator('#btn-confirm-add').click();
+  await expect(page.locator('#contacts-list')).toContainText(
+    'Synthetic delayed-focus peer',
+  );
+});
+
+test('vault recreation controls stay disabled until pending deletion completes', async ({
+  page,
+}) => {
+  await openVault(page);
+  // Exclude the preceding create submission from the destruction interleaving.
+  await expect(page.locator('#vault-submit')).toBeEnabled();
+  await page.evaluate(async () => {
+    window.pendingDeletionLock = navigator.locks.request(
+      'ECP_SECURE_DB_v2:state',
+      () =>
+        new Promise((resolve) => {
+          window.deletionLockHeld = true;
+          window.releaseDeletionLock = resolve;
+        }),
+    );
+  });
+  await expect
+    .poll(() => page.evaluate(() => window.deletionLockHeld))
+    .toBe(true);
+  page.on('dialog', (dialog) => dialog.accept());
+  await page.locator('#btn-global-settings').click();
+  await page.locator('#btn-destroy-vault').click();
+  try {
+    await expect(page.locator('#vault-screen')).toBeVisible();
+    await expect(page.locator('#vault-submit')).toBeDisabled();
+    await expect(page.locator('#vault-password')).toBeDisabled();
+    await expect(page.locator('#vault-confirm')).toBeDisabled();
+  } finally {
+    await page.evaluate(async () => {
+      window.releaseDeletionLock();
+      await window.pendingDeletionLock;
+    });
+  }
+  await expect(page.locator('#vault-submit')).toHaveText('Create vault');
+  await expect(page.locator('#vault-submit')).toBeEnabled();
+  await expect(page.locator('#vault-password')).toBeEnabled();
+  await expect(page.locator('#vault-confirm')).toBeEnabled();
+  await page.locator('#vault-password').fill(passphrase);
+  await page.locator('#vault-confirm').fill(passphrase);
+  await page.locator('#vault-submit').click();
+  await expect(page.locator('#app-root')).toBeVisible();
+  await expect(page.locator('#vault-error')).toBeEmpty();
+});

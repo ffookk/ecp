@@ -16,6 +16,7 @@ Changes below describe this experimental fork of [jamesliu96/ecp](https://github
 - Capture vault access before protocol and identity operations enter a lock queue; reject work crossing a lock/unlock cycle, including a cycle completed before the queue resumes.
 - Bind peer import, alias editing, metadata and clipboard completions to their initiating UI state. Invalidate stale modals and prevent a delayed alias operation from changing another peer's visible title.
 - Add real-browser regressions for delayed operations and protocol upgrade handling; run the suite in Chromium, Firefox and WebKit in CI.
+- Initialize modal focus synchronously so delayed animation frames cannot redirect fingerprint entry. Disable vault form input while deletion, durable status loading or a submission is pending.
 - Add an offline runnable package with a loopback server and checksum manifests; restrict CI artifacts to the intended package. No automatic deployment is added.
 - Add a publication privacy gate for staged files, reachable history and commit metadata, with synthetic regression fixtures generated outside the checkout.
 - Document protocol framing, derivation, snapshot limitations and remaining independent-review requirements. Experimental status is retained.

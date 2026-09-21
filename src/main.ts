@@ -659,16 +659,11 @@ UI.$('#btn-add-contact').onclick = async () => {
     `);
 
     const assertModal = captureUi(true, true);
-    requestAnimationFrame(() => {
-      if (!isCurrent(assertModal)) return;
-      const input = UI.$<HTMLInputElement>('#new-alias-input');
-      if (input) {
-        input.focus();
-        input.onkeydown = (e) => {
-          if (e.key === 'Enter') UI.$('#btn-confirm-add').click();
-        };
-      }
-    });
+    const input = UI.$<HTMLInputElement>('#new-alias-input');
+    input.focus();
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') UI.$('#btn-confirm-add').click();
+    };
 
     UI.$('#new-peer-fp').textContent = fp;
     UI.$('#btn-cancel-add').onclick = UI.closeModal;
@@ -769,17 +764,12 @@ UI.$('#btn-rename-contact').onclick = async () => {
   `);
 
     const assertModal = captureUi(true, true);
-    requestAnimationFrame(() => {
-      if (!isCurrent(assertModal)) return;
-      const input = UI.$<HTMLInputElement>('#rename-val');
-      if (input) {
-        input.value = contact.name;
-        input.focus();
-        input.onkeydown = (e) => {
-          if (e.key === 'Enter') UI.$('#btn-save').click();
-        };
-      }
-    });
+    const input = UI.$<HTMLInputElement>('#rename-val');
+    input.value = contact.name;
+    input.focus();
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') UI.$('#btn-save').click();
+    };
 
     UI.$('#btn-cancel').onclick = UI.closeModal;
     UI.$('#btn-save').onclick = async () => {
@@ -1130,6 +1120,15 @@ let uiGeneration = 0;
 let lockTimer: ReturnType<typeof setTimeout> | undefined;
 let newVault = true;
 let vaultScreenSeq = 0;
+let vaultScreenReady = false;
+let vaultFormPending = false;
+function updateVaultControls() {
+  const disabled = !vaultScreenReady || vaultFormPending;
+  UI.$<HTMLInputElement>('#vault-password').disabled = disabled;
+  UI.$<HTMLInputElement>('#vault-confirm').disabled = disabled;
+  UI.$<HTMLButtonElement>('#vault-submit').disabled =
+    disabled || !navigator.locks || !crypto.subtle;
+}
 
 async function updateContact(
   fp: string,
@@ -1196,6 +1195,9 @@ async function showVaultScreen() {
   if (Vault.isUnlocked()) return;
   const sequence = ++vaultScreenSeq;
   const generation = uiGeneration;
+  vaultScreenReady = false;
+  updateVaultControls();
+  UI.$('#vault-submit').textContent = 'Loading vault…';
   UI.$('#app-root').classList.add('hidden');
   UI.$('#vault-screen').classList.remove('hidden');
   const status = await Vault.status();
@@ -1216,6 +1218,8 @@ async function showVaultScreen() {
     ? 'new-password'
     : 'current-password';
   UI.$('#legacy-notice').classList.toggle('hidden', !hasLegacyData);
+  vaultScreenReady = true;
+  updateVaultControls();
   if (!navigator.locks || !crypto.subtle) {
     UI.$('#vault-error').textContent =
       'Use a browser with Web Crypto and Web Locks over HTTPS or localhost.';
@@ -1225,18 +1229,21 @@ async function showVaultScreen() {
 
 UI.$<HTMLFormElement>('#vault-form').onsubmit = async (event) => {
   event.preventDefault();
+  if (!vaultScreenReady || vaultFormPending) return;
   const password = UI.$<HTMLInputElement>('#vault-password');
   const confirmation = UI.$<HTMLInputElement>('#vault-confirm');
-  const button = UI.$<HTMLButtonElement>('#vault-submit');
-  button.disabled = true;
+  const passphrase = password.value;
+  const confirmed = confirmation.value;
+  password.value = '';
+  confirmation.value = '';
+  vaultFormPending = true;
+  updateVaultControls();
   UI.$('#vault-error').textContent = '';
   try {
-    if (newVault && password.value !== confirmation.value)
+    if (newVault && passphrase !== confirmed)
       throw new Error('Passphrases do not match.');
-    if (newVault) await Vault.create(password.value);
-    else await Vault.unlock(password.value);
-    password.value = '';
-    confirmation.value = '';
+    if (newVault) await Vault.create(passphrase);
+    else await Vault.unlock(passphrase);
     await getLocalIdentity();
     await renderSidebar();
     if (!Vault.isUnlocked())
@@ -1252,9 +1259,8 @@ UI.$<HTMLFormElement>('#vault-form').onsubmit = async (event) => {
         ? error.message
         : 'Unable to unlock vault. Check your passphrase.';
   } finally {
-    password.value = '';
-    confirmation.value = '';
-    button.disabled = false;
+    vaultFormPending = false;
+    updateVaultControls();
   }
 };
 
