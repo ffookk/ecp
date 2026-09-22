@@ -32,18 +32,18 @@ The vault is a separate layer: it retains Web Crypto AES-256-GCM with a fresh ra
 
 `H` means SHA-256, `HMAC` means HMAC-SHA-256, and `HKDF(ikm, salt, info, size)` means HKDF-SHA-256. Labels are exact UTF-8 bytes with no terminator. `Z32` is 32 zero bytes. Concatenation is `||`.
 
-| Purpose                                         | Derivation                                 |
-| ----------------------------------------------- | ------------------------------------------ |
-| Initial shared secret `SK`                      | `HKDF("ECP-INIT-v3"                        |     | dh                                                                              |     | kem, Z32, "", 32)`     |
-| Initial root `RK0`                              | `HKDF(SK, Z32, "ECP-DR-ROOT-v3", 32)`      |
-| INIT message material                           | `HKDF(SK, Z32, "ECP-INIT-MESSAGE-v3", 32)` |
-| INIT or MSG AEAD key from message material `mk` | `HKDF(mk, Z32, "ECP-AES256GCMSIV-v3", 32)` |
-| RESP AEAD key                                   | `HKDF(SK, Z32, "ECP-RESP-v3", 32)`         |
-| Ratchet root/chain output                       | `HKDF(dh                                   |     | kem, RK, "ECP-DR-RK-v3", 64)`; first 32 bytes become root, last 32 become chain |
-| Message material from chain `CK`                | `HMAC(CK, 0x01)`                           |
-| Next chain                                      | `HMAC(CK, 0x02)`                           |
-| Conversation ID                                 | First 16 bytes of `H("ECP-CONVERSATION-v3" |     | initiatorEphemeralX25519Public                                                  |     | initialKemCiphertext)` |
-| INIT replay identifier                          | `H("ECP-INIT-REPLAY-v3"                    |     | signedTranscript)`                                                              |
+```text
+SK             = HKDF("ECP-INIT-v3" || dh || kem, Z32, "", 32)
+RK0            = HKDF(SK, Z32, "ECP-DR-ROOT-v3", 32)
+INIT material  = HKDF(SK, Z32, "ECP-INIT-MESSAGE-v3", 32)
+INIT/MSG key   = HKDF(mk, Z32, "ECP-AES256GCMSIV-v3", 32)
+RESP key       = HKDF(SK, Z32, "ECP-RESP-v3", 32)
+Root || chain  = HKDF(dh || kem, RK, "ECP-DR-RK-v3", 64)
+Message mk     = HMAC(CK, 0x01)
+Next chain     = HMAC(CK, 0x02)
+ConversationID = first16(H("ECP-CONVERSATION-v3" || initiatorEphemeralX25519Public || initialKemCiphertext))
+INIT replay ID = H("ECP-INIT-REPLAY-v3" || signedTranscript)
+```
 
 The initial DH combines the initiator's ephemeral X25519 key with the recipient's static X25519 key. Initial KEM encapsulation targets the recipient's static ML-KEM public key. This initial secret does not, on its own, establish forward secrecy against later compromise of recipient static private keys. INIT deliberately carries no user content.
 
@@ -93,7 +93,7 @@ A MSG is at least 3,232 bytes, with a maximum UTF-8 plaintext length of 1,045,34
 
 Associated data is `"ECP-MSG-v3" || conversationId || senderIdentityBundle || recipientIdentityBundle || packet[12:3204]`. The outer MSG header is validated separately with fixed magic/version/type/reserved fields and exact total length. The identity order is identical at both endpoints.
 
-Sending derives a message key and next chain key from the current CKs and commits the incremented Ns and outgoing history atomically. When no sending chain exists, it generates fresh DH and KEM ratchet keys, encapsulates to the current peer KEM key, derives a new root/chain, records PN and resets Ns to zero.
+Sending derives a message key and next chain key from the current CKs and commits the incremented Ns before returning ciphertext. Plaintext history joins that same transaction only when the current encrypted contact record explicitly has `saveHistory === true`. Missing or false preferences do not save new history. Receiving applies the same policy after authentication; omitting history never omits ratchet or replay-state commits. When no sending chain exists, it generates fresh DH and KEM ratchet keys, encapsulates to the current peer KEM key, derives a new root/chain, records PN and resets Ns to zero.
 
 Receiving looks up the conversation, requires an established v3 session and unchanged verified peer identity, then authenticates using a cached skipped key or the appropriate receiving chain. For a changed DH public key, it first derives bounded skipped keys for the previous chain, derives the new receiving root/chain, updates peer ratchet keys and creates the next local sending chain. The new receiving chain is assigned after that transition so it is not overwritten by an older staged value. State mutations remain operation-local until authentication and transaction success.
 
@@ -101,7 +101,7 @@ The combined previous/new-chain skipped-position budget is 100 per packet, valid
 
 ## Persistence, operation lifetime and recovery
 
-Each public protocol operation captures a vault-access guard before joining the origin-wide state Web Lock. The guard is checked upon acquiring the lock and before/after each asynchronous operation. A lock/unlock cycle invalidates the guard even if the vault is unlocked again before the queued action resumes. Identity creation has its own origin-wide lock with the same lifetime guard. Storage encrypts batches before committing in one IndexedDB transaction, with vault/metadata checks and transaction completion awaited.
+Each public protocol operation captures a vault-access guard before joining the origin-wide state Web Lock. The guard is checked upon acquiring the lock and before/after each asynchronous operation. A lock/unlock cycle invalidates the guard even if the vault is unlocked again before the queued action resumes. Identity creation has its own origin-wide lock with the same lifetime guard. Storage encrypts batches before committing in one IndexedDB transaction, with vault/metadata/identity-envelope checks and transaction completion awaited. Vault creation atomically commits its encrypted identity and a verifier bound to all identity key material. Existing identity reads never create keys. Unlock validates the encrypted identity before exposing the candidate vault key; the first successful unlock of an intact older verifier binds it to that same identity without changing identity, peer, channel, message or replay records. Missing identity rejects unlock and does not migrate. This binding does not establish snapshot freshness.
 
 Peer deletion/reset uses the state lock and removes all histories indexed by that peer. INIT replay tombstones survive these operations. Whole-vault deletion removes identity and replay data. Neither logical deletion nor locking promises physical memory/storage erasure.
 

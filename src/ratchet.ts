@@ -33,6 +33,7 @@ import {
   calculateFingerprint,
 } from './identity.js';
 import { DB, Vault } from './storage.js';
+import type { StoreEntry } from './storage.js';
 import { withStateLock } from './locks.js';
 import type { Session, Message } from './types.js';
 
@@ -456,7 +457,9 @@ export const EncryptMessage = (contactFp: string, text: string) =>
           'An established channel is required before sending content.',
         );
       checkSession(session);
-      await access(() => requirePeer(contactFp, session.peerIdentity));
+      const { contact } = await access(() =>
+        requirePeer(contactFp, session.peerIdentity),
+      );
       if (!session.CKs) stepDH(session);
       if (!session.CKs || !session.pendingKemCt || !session.KEMs)
         throw new Error('Missing sending chain.');
@@ -498,13 +501,12 @@ export const EncryptMessage = (contactFp: string, text: string) =>
         buildHeader(Config.PACKET_TYPES.MSG, payload.length),
         payload,
       );
-      await access(() =>
-        DB.putMany([
-          ['sessions', session],
-          ['messages', messageRecord(session, text, true)],
-        ]),
-      );
-      return { packet, session };
+      const message = messageRecord(session, text, true);
+      const saved = contact.saveHistory === true;
+      const entries: StoreEntry[] = [['sessions', session]];
+      if (saved) entries.push(['messages', message]);
+      await access(() => DB.putMany(entries));
+      return { packet, session, message, saved };
     } finally {
       clear(plaintext);
     }
@@ -536,7 +538,9 @@ export const DecryptMessage = (packet: Uint8Array) =>
     if (!session || session.state !== 'ESTABLISHED' || !session.DHr)
       throw new Error('Established session not found for this message.');
     checkSession(session);
-    await access(() => requirePeer(session.contactFp, session.peerIdentity));
+    const { contact } = await access(() =>
+      requirePeer(session.contactFp, session.peerIdentity),
+    );
     const aad = concatBytes(
       encodeUTF8('ECP-MSG-v3'),
       cId,
@@ -630,11 +634,10 @@ export const DecryptMessage = (packet: Uint8Array) =>
     } finally {
       clear(plaintext);
     }
-    await access(() =>
-      DB.putMany([
-        ['sessions', session],
-        ['messages', messageRecord(session, text, false)],
-      ]),
-    );
-    return { session, plaintext: text };
+    const message = messageRecord(session, text, false);
+    const saved = contact.saveHistory === true;
+    const entries: StoreEntry[] = [['sessions', session]];
+    if (saved) entries.push(['messages', message]);
+    await access(() => DB.putMany(entries));
+    return { session, plaintext: text, message, saved };
   });

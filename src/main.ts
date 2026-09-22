@@ -2,6 +2,7 @@ import { Config } from './config.js';
 import { concatBytes, decodeBase64URL, encodeBase64URL } from './crypto.js';
 import { DB, Vault } from './storage.js';
 import { withStateLock } from './locks.js';
+import { TransientHistory } from './history.js';
 import { formatEnvelope, parseEnvelope, parseHeader } from './codec.js';
 import {
   calculateFingerprint,
@@ -17,6 +18,8 @@ import {
   DecryptMessage,
 } from './ratchet.js';
 import type { Contact } from './types.js';
+
+const transientHistory = new TransientHistory();
 
 const State = {
   currentContactFp: undefined as string | undefined,
@@ -128,6 +131,7 @@ function resetChatView(updateHash = true) {
   UI.$('#chat-messages').replaceChildren();
   UI.$('#chat-title').textContent = 'Select a Peer';
   UI.$('#chat-status-text').textContent = 'Idle';
+  UI.$('#history-status').textContent = '';
   UI.$('#chat-status-dot').className = 'w-2 h-2 rounded-full bg-slate-500';
   UI.$('#chat-input-area').classList.add('hidden');
   UI.$('#empty-state').classList.remove('hidden');
@@ -206,13 +210,17 @@ async function renderSidebar() {
         ({ contactFp }) => contactFp === c.fingerprint,
       );
       if (session)
-        unreadCount = (
-          await DB.getAllByIndex(
+        unreadCount = [
+          ...(await DB.getAllByIndex(
             'messages',
             'conversationId',
             session.conversationId,
-          )
-        ).filter(
+          )),
+          ...transientHistory.forConversation(
+            c.fingerprint,
+            session.conversationId,
+          ),
+        ].filter(
           ({ isMe, timestamp }) => !isMe && timestamp > c.lastReadTimestamp,
         ).length;
     }
@@ -338,15 +346,22 @@ async function renderChatLog(isInitialView = false) {
   const generation = uiGeneration;
 
   const sessions = await DB.getAll('sessions');
+  const contact = await DB.get('contacts', contactFp);
   const session = sessions.find(
     (candidate) => candidate.contactFp === contactFp,
   );
   if (
     currentSeq !== renderSeq ||
     !Vault.isUnlocked() ||
-    generation !== uiGeneration
+    generation !== uiGeneration ||
+    contactFp !== State.currentContactFp
   )
     return;
+
+  UI.$('#history-status').textContent =
+    contact?.saveHistory === true
+      ? 'Saving new messages in this encrypted vault. Earlier temporary messages stay temporary.'
+      : 'New messages stay in this tab only, until lock, reload, or the 100-message / 8 MiB cache limit. Previously saved history remains until you clear it.';
 
   const compatible = session?.version === Config.WIRE_PROTOCOL_VERSION;
   if (session && !compatible) {
@@ -401,11 +416,14 @@ async function renderChatLog(isInitialView = false) {
     : undefined;
 
   const allChatMsgs = session
-    ? await DB.getAllByIndex(
-        'messages',
-        'conversationId',
-        session.conversationId,
-      )
+    ? [
+        ...(await DB.getAllByIndex(
+          'messages',
+          'conversationId',
+          session.conversationId,
+        )),
+        ...transientHistory.forConversation(contactFp, session.conversationId),
+      ]
     : [];
 
   const chatMsgs = allChatMsgs.sort((a, b) =>
@@ -521,8 +539,13 @@ const submitChatMessage = async (
   submitBtn.disabled = true;
 
   try {
-    const { packet, session } = await EncryptMessage(targetFp, text);
+    const remember = transientHistory.captureWrite();
+    const { packet, session, message, saved } = await EncryptMessage(
+      targetFp,
+      text,
+    );
     if (!Vault.isUnlocked() || generation !== uiGeneration) return;
+    if (!saved) remember(message);
     const response = session.lastRespPacket
       ? decodeBase64URL(session.lastRespPacket)
       : undefined;
@@ -646,11 +669,11 @@ UI.$('#btn-add-contact').onclick = async () => {
       <div class="p-4 bg-slate-900 border-b border-slate-800"><h3 class="font-bold text-slate-200">Link New Peer</h3></div>
       <div class="p-4">
         <label class="block text-xs text-slate-400 mb-1">Assign Local Alias</label>
-        <input type="text" id="new-alias-input" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:border-indigo-500 outline-none min-h-11 text-base sm:text-sm transition-colors" placeholder="e.g. Work Laptop" />
+        <input type="text" id="new-alias-input" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:border-indigo-500 outline-none min-h-11 text-base sm:text-sm transition-colors" placeholder="e.g. Work Laptop" />
         <p class="text-xs text-amber-300 mt-3">Compare this full fingerprint with your peer using a separate trusted channel. Do not trust a fingerprint sent alongside this bundle.</p>
         <div id="new-peer-fp" class="font-mono text-xs break-all select-all my-3"></div>
         <label class="block text-xs text-slate-400">Enter the fingerprint confirmed by your peer</label>
-        <input id="verified-fp-input" autocomplete="off" class="w-full rounded border p-2 bg-slate-950" />
+        <input id="verified-fp-input" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" class="w-full rounded border p-2 bg-slate-950" />
       </div>
       <div class="p-4 bg-slate-900 flex justify-end gap-2 border-t border-slate-800/50">
         <button id="btn-cancel-add" class="px-4 py-2 text-sm text-slate-400 hover:text-slate-200 min-h-11 cursor-pointer transition-colors">Cancel</button>
@@ -756,7 +779,7 @@ UI.$('#btn-rename-contact').onclick = async () => {
 
     UI.showModal(`
     <div class="p-4 border-b border-slate-800"><h3 class="font-bold text-slate-200">Rename Alias</h3></div>
-    <div class="p-4"><input type="text" id="rename-val" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 min-h-11 text-base sm:text-sm text-slate-200 focus:border-indigo-500 outline-none transition-colors" /></div>
+    <div class="p-4"><input type="text" id="rename-val" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 min-h-11 text-base sm:text-sm text-slate-200 focus:border-indigo-500 outline-none transition-colors" /></div>
     <div class="p-4 flex justify-end gap-2 border-t border-slate-800/50">
       <button id="btn-cancel" class="px-4 py-2 text-sm text-slate-400 hover:text-slate-200 min-h-11 cursor-pointer transition-colors">Cancel</button>
       <button id="btn-save" class="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg min-h-11 cursor-pointer transition-colors shadow-sm">Save</button>
@@ -796,6 +819,86 @@ UI.$('#btn-rename-contact').onclick = async () => {
     };
   } catch {
     if (isCurrent(assertCurrent)) UI.showToast('Unable to open peer.');
+  }
+};
+
+UI.$('#btn-history-settings').onclick = async () => {
+  closePeerDropdown();
+  const targetFp = State.currentContactFp;
+  if (!targetFp) return;
+  const assertCurrent = captureUi(true, true);
+  try {
+    const contact = await DB.get('contacts', targetFp);
+    assertCurrent();
+    if (!contact) return;
+    UI.showModal(`
+      <div class="p-4 border-b border-slate-800"><h3 class="font-bold text-slate-200">Local message history</h3></div>
+      <div class="p-4 space-y-4 text-sm text-slate-300">
+        <label class="flex items-start gap-3"><input id="save-history" type="checkbox" class="mt-1" /><span>Save new messages for this peer in the encrypted vault</span></label>
+        <p>Saving is off by default. Without saving, messages stay only in this unlocked tab. Locking or reloading clears them. The temporary cache holds at most 100 messages and 8 MiB of message data across all peers, removing the oldest first.</p>
+        <p>Turning saving on affects future messages only. Turning it off preserves previously saved history. Anyone who can unlock this vault can read that saved history.</p>
+        <button id="btn-clear-history" class="rounded bg-red-900 p-3 min-h-11">Clear all local history for this peer</button>
+        <p class="text-xs text-slate-400">Clearing preserves the peer, channel and replay protection. It cannot erase copies in the clipboard, backups, browser internals or another person's device.</p>
+      </div>
+      <div class="p-4 flex justify-end gap-2 border-t border-slate-800/50">
+        <button id="btn-cancel-history" class="px-4 py-2 min-h-11 text-slate-400">Cancel</button>
+        <button id="btn-save-history" class="px-4 py-2 min-h-11 bg-indigo-600 rounded-lg text-white">Save preference</button>
+      </div>`);
+    const assertModal = captureUi(true, true);
+    UI.$<HTMLInputElement>('#save-history').checked =
+      contact.saveHistory === true;
+    UI.$('#btn-cancel-history').onclick = UI.closeModal;
+    UI.$('#btn-save-history').onclick = async () => {
+      try {
+        assertModal();
+        const saveHistory = UI.$<HTMLInputElement>('#save-history').checked;
+        await updateContact(
+          targetFp,
+          (current) => {
+            current.saveHistory = saveHistory;
+          },
+          assertModal,
+        );
+        assertModal();
+        UI.closeModal();
+        await renderChatLog();
+        UI.showToast(
+          saveHistory
+            ? 'Future messages will be saved in this vault.'
+            : 'Future messages will stay temporary. Existing saved history is unchanged.',
+        );
+      } catch {
+        if (isCurrent(assertModal))
+          UI.showToast('Unable to save the history preference.');
+      }
+    };
+    UI.$('#btn-clear-history').onclick = async () => {
+      try {
+        assertModal();
+        if (
+          !confirm(
+            'Clear all saved and temporary local history for this peer, including previous channels? This cannot be undone.',
+          )
+        )
+          return;
+        assertModal();
+        await DB.clearPeerHistory(targetFp, assertModal);
+        transientHistory.clearPeer(targetFp);
+        assertModal();
+        UI.closeModal();
+        await renderChatLog();
+        await renderSidebar();
+        UI.showToast(
+          'Local history cleared. The channel and history preference are unchanged.',
+        );
+      } catch {
+        if (isCurrent(assertModal))
+          UI.showToast('Unable to clear local history.');
+      }
+    };
+  } catch {
+    if (isCurrent(assertCurrent))
+      UI.showToast('Unable to open history settings.');
   }
 };
 
@@ -856,6 +959,7 @@ UI.$('#btn-delete-contact').onclick = async () => {
       try {
         assertModal();
         await DB.deletePeer(targetFp);
+        transientHistory.clearPeer(targetFp);
         assertModal();
         UI.closeModal();
         resetChatView(true);
@@ -896,6 +1000,7 @@ UI.$('#btn-reset-session').onclick = async () => {
       try {
         assertModal();
         await DB.deletePeer(targetFp, false);
+        transientHistory.clearPeer(targetFp);
         assertModal();
         UI.closeModal();
         await renderChatLog();
@@ -914,7 +1019,7 @@ UI.$('#btn-reset-session').onclick = async () => {
 UI.$('#btn-global-settings').onclick = () => {
   UI.showModal(`
     <div class="p-4 space-y-4"><h3 class="font-bold">Encrypted local vault</h3>
-      <p class="text-sm">Keys and history are encrypted with your passphrase. The vault locks after five minutes of inactivity. There is no password recovery. The clipboard and exported packets are outside the vault.</p>
+      <p class="text-sm">Keys and explicitly saved history are encrypted with your passphrase. New messages stay temporary unless you enable saving for that peer. The vault locks after five minutes of inactivity, clearing this tab's temporary messages. There is no password recovery. The clipboard and exported packets are outside the vault.</p>
       <button id="btn-lock-vault" class="rounded bg-indigo-600 p-3">Lock now</button>
       <button id="btn-destroy-vault" class="rounded bg-red-900 p-3">Delete all local data</button>
     </div>`);
@@ -1000,8 +1105,10 @@ async function processClipboardText(
             sessionChanged = true;
           }
         } else if (type === Config.PACKET_TYPES.MSG) {
-          await DecryptMessage(pktBytes);
+          const remember = transientHistory.captureWrite();
+          const { message, saved } = await DecryptMessage(pktBytes);
           assertCurrent();
+          if (!saved) remember(message);
           UI.showToast('Message decrypted.');
           sessionChanged = true;
         }
@@ -1157,8 +1264,23 @@ function armAutoLock() {
 }
 for (const name of ['pointerdown', 'keydown'])
   addEventListener(name, armAutoLock, { passive: true });
-addEventListener('pagehide', () => Vault.lock());
+addEventListener('pagehide', () => {
+  transientHistory.clear();
+  Vault.lock();
+});
+addEventListener('ecp-history-cleared', (event) => {
+  const contactFp = (event as CustomEvent<{ contactFp?: string }>).detail
+    ?.contactFp;
+  if (typeof contactFp !== 'string') return;
+  transientHistory.clearPeer(contactFp);
+  if (Vault.isUnlocked()) {
+    if (State.currentContactFp === contactFp)
+      void renderChatLog().catch(showStorageError);
+    void renderSidebar().catch(showStorageError);
+  }
+});
 addEventListener('ecp-vault-locked', () => {
+  transientHistory.clear();
   uiGeneration++;
   renderSeq++;
   clearTimeout(lockTimer);
@@ -1176,6 +1298,7 @@ addEventListener('ecp-vault-locked', () => {
     'my-fingerprint',
     'metadata-content',
     'modal-container',
+    'history-status',
   ])
     UI.$(`#${id}`).replaceChildren();
   UI.$('#chat-title').textContent = 'Select a Peer';

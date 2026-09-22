@@ -51,6 +51,14 @@ clipboard access and delivery.
 This is a custom, independently unaudited protocol. Verify full peer
 fingerprints through a separate trusted channel. Use a strong vault passphrase;
 there is no backup, passphrase recovery or supported session migration.
+New message text and media stay temporary in the sending/importing tab by
+default. Explicitly enable saving per peer if needed. Temporary messages are
+discarded on lock/reload/close or bounded-cache eviction; old saved history is
+preserved until explicitly cleared. Ratchet and replay state still persist.
+The first successful unlock of an intact older vault binds its existing
+identity to the verifier. Use this build in every tab afterward: older builds
+cannot unlock the upgraded verifier. Missing identity stops unlock without
+silently creating replacement keys.
 Do not clone or restore active session databases: this can repeat ratchet keys,
 counters and replay history. Protocol v3 uses fresh message nonces and AES-GCM-SIV
 to mitigate nonce misuse; these measures do not establish snapshot freshness.

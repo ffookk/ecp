@@ -345,7 +345,7 @@ test('a stored v2 channel remains readable and disabled until explicit channel w
   expect(after.contact).toEqual(before.contact);
 });
 
-test('identity creation queued before lock cannot create keys after a later unlock', async ({
+test('identity reads queued before lock expire while the original keys survive unlock', async ({
   page,
 }) => {
   await openVault(page);
@@ -353,7 +353,7 @@ test('identity creation queued before lock cannot create keys after a later unlo
     const { DB, Vault } = await import('/storage.js');
     const { getLocalIdentity } = await import('/identity.js');
     const { withNamedLock } = await import('/locks.js');
-    await DB.delete('identity', 'local');
+    const original = (await getLocalIdentity()).ecPk;
     let release;
     let entered;
     const started = new Promise((resolve) => {
@@ -375,18 +375,17 @@ test('identity creation queued before lock cannot create keys after a later unlo
     release();
     await held;
     const outcome = await pending;
-    const absent = (await DB.get('identity', 'local')) === undefined;
-    await getLocalIdentity();
+    const current = (await getLocalIdentity()).ecPk;
     return {
       outcome,
-      absent,
-      freshCreated: Boolean(await DB.get('identity', 'local')),
+      unchanged: original.every((byte, index) => byte === current[index]),
+      identityCount: (await DB.getAll('identity')).length,
     };
   }, passphrase);
   expect(result).toEqual({
     outcome: 'expired',
-    absent: true,
-    freshCreated: true,
+    unchanged: true,
+    identityCount: 1,
   });
 });
 
@@ -478,4 +477,50 @@ test('vault recreation controls stay disabled until pending deletion completes',
   await page.locator('#vault-submit').click();
   await expect(page.locator('#app-root')).toBeVisible();
   await expect(page.locator('#vault-error')).toBeEmpty();
+});
+
+test('missing persisted identity rejects normal UI unlock without creating replacement keys', async ({
+  page,
+}) => {
+  await openVault(page);
+  await page.evaluate(async () => {
+    const { Vault } = await import('/storage.js');
+    Vault.lock();
+    const db = await new Promise((resolve, reject) => {
+      const req = indexedDB.open('ECP_SECURE_DB_v2', 1);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('identity', 'readwrite');
+      tx.objectStore('identity').delete('local');
+      tx.oncomplete = resolve;
+      tx.onabort = () => reject(tx.error);
+    });
+    db.close();
+  });
+  await expect(page.locator('#vault-submit')).toHaveText('Unlock');
+  await page.locator('#vault-password').fill(passphrase);
+  await page.locator('#vault-submit').click();
+  await expect(page.locator('#vault-error')).toContainText(
+    'identity is missing',
+  );
+  await expect(page.locator('#app-root')).toBeHidden();
+  const result = await page.evaluate(async () => {
+    const { Vault } = await import('/storage.js');
+    const db = await new Promise((resolve, reject) => {
+      const req = indexedDB.open('ECP_SECURE_DB_v2', 1);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    const count = await new Promise((resolve, reject) => {
+      const tx = db.transaction('identity', 'readonly');
+      const req = tx.objectStore('identity').count();
+      tx.oncomplete = () => resolve(req.result);
+      tx.onabort = () => reject(tx.error);
+    });
+    db.close();
+    return { count, unlocked: Vault.isUnlocked() };
+  });
+  expect(result).toEqual({ count: 0, unlocked: false });
 });

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" translate="no" spellcheck="false">
   <head>
     <meta charset="UTF-8" />
     <meta
@@ -27,7 +27,7 @@
       </p>
       <h1 id="vault-title" class="text-2xl font-bold">Encrypted local vault</h1>
       <p class="text-sm text-slate-400">
-        Your passphrase encrypts local keys and history. Use at least 12
+        Your passphrase encrypts local keys and saved history. Use at least 12
         characters, preferably several random words. There is no password
         recovery. The vault locks after five minutes of inactivity.
       </p>
@@ -274,6 +274,12 @@
               >
                 <div class="py-1">
                   <button
+                    id="btn-history-settings"
+                    class="min-h-11 w-full cursor-pointer px-4 py-2.5 text-left text-xs font-medium text-slate-300 hover:bg-slate-800"
+                  >
+                    Message History
+                  </button>
+                  <button
                     id="btn-rename-contact"
                     class="min-h-11 w-full cursor-pointer px-4 py-2.5 text-left text-xs font-medium text-slate-300 hover:bg-slate-800"
                   >
@@ -317,6 +323,10 @@
           />
         </div>
 
+        <p
+          id="history-status"
+          class="shrink-0 border-b border-slate-800 px-4 py-2 text-xs text-amber-300"
+        ></p>
         <div
           id="chat-messages"
           class="relative flex min-h-0 flex-1 flex-col gap-y-3.5 overflow-y-auto overscroll-y-contain p-4 pb-6 select-text"
@@ -347,7 +357,7 @@
             Terminal Idle
           </h3>
           <p class="mb-6 max-w-sm text-xs text-slate-500">
-            Select a trusted peer to begin secure post-quantum communication.
+            Select a verified peer to exchange encrypted packets.
           </p>
         </div>
 
@@ -391,6 +401,9 @@
               class="min-h-11 min-w-0 flex-1 rounded-lg border border-slate-700/80 bg-slate-950 px-3 py-2 text-base text-slate-200 transition-colors focus:border-emerald-500 focus:outline-none sm:px-4 sm:text-sm"
               placeholder="Type message..."
               autocomplete="off"
+              spellcheck="false"
+              autocorrect="off"
+              autocapitalize="off"
               enterkeyhint="send"
             />
             <button

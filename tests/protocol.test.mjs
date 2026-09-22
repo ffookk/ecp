@@ -656,3 +656,150 @@ test('vault invalidation during a protocol read cannot become a later-generation
   );
   assert.deepEqual(a.DB.snapshot(), before);
 });
+
+test('new message history defaults off for absent, false and non-boolean preferences', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  const { a, b } = await pair();
+  const setPreference = async (peer, other, value) => {
+    const contact = await peer.DB.get('contacts', other.fingerprint);
+    if (value === undefined) delete contact.saveHistory;
+    else contact.saveHistory = value;
+    await peer.DB.put('contacts', contact);
+  };
+  for (const value of [undefined, false, 'true', 1]) {
+    await setPreference(a, b, value);
+    await setPreference(b, a, value);
+    const sent = await a.EncryptMessage(
+      b.fingerprint,
+      `temporary ${String(value)}`,
+    );
+    const received = await b.DecryptMessage(sent.packet);
+    assert.equal(sent.saved, false);
+    assert.equal(received.saved, false);
+    assert.equal(sent.message.text, received.plaintext);
+    assert.equal(received.message.text, received.plaintext);
+    assert.equal(sent.message.contactFp, b.fingerprint);
+    assert.equal(received.message.contactFp, a.fingerprint);
+    assert.equal(sent.message.isMe, true);
+    assert.equal(received.message.isMe, false);
+    assert.equal((await a.DB.getAll('messages')).length, 0);
+    assert.equal((await b.DB.getAll('messages')).length, 0);
+    const beforeReplay = b.DB.snapshot();
+    await assert.rejects(
+      b.DecryptMessage(sent.packet),
+      /replayed|out of order/,
+    );
+    assert.deepEqual(b.DB.snapshot(), beforeReplay);
+  }
+});
+
+test('each peer explicitly opts in and disabling history preserves old records', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  const { a, b } = await pair();
+  const setPreference = async (peer, other, saveHistory) => {
+    const contact = await peer.DB.get('contacts', other.fingerprint);
+    await peer.DB.put('contacts', { ...contact, saveHistory });
+  };
+  await setPreference(a, b, true);
+  await setPreference(b, a, false);
+  const first = await a.EncryptMessage(b.fingerprint, 'saved only by sender');
+  assert.equal(first.saved, true);
+  assert.equal((await b.DecryptMessage(first.packet)).saved, false);
+  assert.deepEqual(await a.DB.getAll('messages'), [first.message]);
+  assert.deepEqual(await b.DB.getAll('messages'), []);
+
+  await setPreference(a, b, false);
+  await setPreference(b, a, true);
+  const second = await a.EncryptMessage(
+    b.fingerprint,
+    'saved only by receiver',
+  );
+  const received = await b.DecryptMessage(second.packet);
+  assert.equal(second.saved, false);
+  assert.equal(received.saved, true);
+  assert.deepEqual(await a.DB.getAll('messages'), [first.message]);
+  assert.deepEqual(await b.DB.getAll('messages'), [received.message]);
+});
+
+test('queued send and receive use the preference current under the state lock', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  const { a, b } = await pair();
+  const changeBeforeOperation = async (peer, other, saveHistory, operation) => {
+    let entered, release;
+    const ready = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const held = peer.withStateLock(async () => {
+      entered();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      const contact = await peer.DB.get('contacts', other.fingerprint);
+      await peer.DB.put('contacts', { ...contact, saveHistory });
+    });
+    await ready;
+    const pending = operation();
+    release();
+    await held;
+    return pending;
+  };
+  const sent = await changeBeforeOperation(a, b, false, () =>
+    a.EncryptMessage(b.fingerprint, 'queued temporary'),
+  );
+  assert.equal(sent.saved, false);
+  const received = await changeBeforeOperation(b, a, false, () =>
+    b.DecryptMessage(sent.packet),
+  );
+  assert.equal(received.saved, false);
+  assert.deepEqual(await a.DB.getAll('messages'), []);
+  assert.deepEqual(await b.DB.getAll('messages'), []);
+
+  const optedIn = await changeBeforeOperation(a, b, true, () =>
+    a.EncryptMessage(b.fingerprint, 'queued saved'),
+  );
+  assert.equal(optedIn.saved, true);
+  const receivedSaved = await changeBeforeOperation(b, a, true, () =>
+    b.DecryptMessage(optedIn.packet),
+  );
+  assert.equal(receivedSaved.saved, true);
+  assert.deepEqual(await a.DB.getAll('messages'), [optedIn.message]);
+  assert.deepEqual(await b.DB.getAll('messages'), [receivedSaved.message]);
+});
+
+test('temporary messages still require an atomic state commit and successful authentication', async (t) => {
+  const { pair } = await createProtocolLab(t);
+  const { a, b } = await pair();
+  for (const [peer, other] of [
+    [a, b],
+    [b, a],
+  ]) {
+    const contact = await peer.DB.get('contacts', other.fingerprint);
+    delete contact.saveHistory;
+    await peer.DB.put('contacts', contact);
+  }
+  const beforeSend = a.DB.snapshot();
+  a.DB.failNextCommit();
+  await assert.rejects(
+    a.EncryptMessage(b.fingerprint, 'failed temporary'),
+    /transaction abort/,
+  );
+  assert.deepEqual(a.DB.snapshot(), beforeSend);
+  const sent = await a.EncryptMessage(b.fingerprint, 'temporary after retry');
+  assert.equal(sequence(sent.packet), 0);
+  const beforeReceive = b.DB.snapshot();
+  await assert.rejects(
+    b.DecryptMessage(
+      changed(sent.packet, (packet) => {
+        packet[packet.length - 1] ^= 1;
+      }),
+    ),
+  );
+  assert.deepEqual(b.DB.snapshot(), beforeReceive);
+  b.DB.failNextCommit();
+  await assert.rejects(b.DecryptMessage(sent.packet), /transaction abort/);
+  assert.deepEqual(b.DB.snapshot(), beforeReceive);
+  const received = await b.DecryptMessage(sent.packet);
+  assert.equal(received.plaintext, 'temporary after retry');
+  assert.equal(received.saved, false);
+  assert.deepEqual(await b.DB.getAll('messages'), []);
+});

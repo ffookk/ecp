@@ -301,7 +301,7 @@ export const EncryptMessage = (contactFp, text) => withProtocolState(async (acce
         if (!session || session.state !== 'ESTABLISHED')
             throw new Error('An established channel is required before sending content.');
         checkSession(session);
-        await access(() => requirePeer(contactFp, session.peerIdentity));
+        const { contact } = await access(() => requirePeer(contactFp, session.peerIdentity));
         if (!session.CKs)
             stepDH(session);
         if (!session.CKs || !session.pendingKemCt || !session.KEMs)
@@ -328,11 +328,13 @@ export const EncryptMessage = (contactFp, text) => withProtocolState(async (acce
         session.Ns++;
         const payload = concatBytes(msgHeader, ciphertext);
         const packet = concatBytes(buildHeader(Config.PACKET_TYPES.MSG, payload.length), payload);
-        await access(() => DB.putMany([
-            ['sessions', session],
-            ['messages', messageRecord(session, text, true)],
-        ]));
-        return { packet, session };
+        const message = messageRecord(session, text, true);
+        const saved = contact.saveHistory === true;
+        const entries = [['sessions', session]];
+        if (saved)
+            entries.push(['messages', message]);
+        await access(() => DB.putMany(entries));
+        return { packet, session, message, saved };
     }
     finally {
         clear(plaintext);
@@ -358,7 +360,7 @@ export const DecryptMessage = (packet) => withProtocolState(async (access) => {
     if (!session || session.state !== 'ESTABLISHED' || !session.DHr)
         throw new Error('Established session not found for this message.');
     checkSession(session);
-    await access(() => requirePeer(session.contactFp, session.peerIdentity));
+    const { contact } = await access(() => requirePeer(session.contactFp, session.peerIdentity));
     const aad = concatBytes(encodeUTF8('ECP-MSG-v3'), cId, decodeBase64URL(session.peerIdentity), serializeIdentityPublic(await access(() => getLocalIdentity())), packet.slice(12, offset));
     const tag = encodeBase64URL(dh);
     const cacheKey = `${tag}_${n}`;
@@ -442,10 +444,12 @@ export const DecryptMessage = (packet) => withProtocolState(async (access) => {
     finally {
         clear(plaintext);
     }
-    await access(() => DB.putMany([
-        ['sessions', session],
-        ['messages', messageRecord(session, text, false)],
-    ]));
-    return { session, plaintext: text };
+    const message = messageRecord(session, text, false);
+    const saved = contact.saveHistory === true;
+    const entries = [['sessions', session]];
+    if (saved)
+        entries.push(['messages', message]);
+    await access(() => DB.putMany(entries));
+    return { session, plaintext: text, message, saved };
 });
 //# sourceMappingURL=ratchet.js.map
