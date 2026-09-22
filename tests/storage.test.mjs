@@ -182,8 +182,10 @@ test('encrypted storage and vault security boundaries', async (t) => {
       await DB.putMany(entries);
       const ivs = new Set();
       for (const [store, original] of entries) {
-        const [envelope] = await raw(store, (objectStore) =>
-          objectStore.getAll(),
+        const envelope = await raw(store, (objectStore) =>
+          objectStore.get(
+            original.id ?? original.fingerprint ?? original.contactFp,
+          ),
         );
         assert.equal(envelope.schema, 2);
         assert.equal(envelope.iv.length, 12);
@@ -519,7 +521,10 @@ test('encrypted storage and vault security boundaries', async (t) => {
       );
       assert.equal(await Vault.status(), 'new');
       await Vault.create('a different secure passphrase');
-      for (const store of stores) assert.deepEqual(await DB.getAll(store), []);
+      assert.equal((await DB.getAll('identity')).length, 1);
+      assert.equal((await DB.get('identity', 'local')).id, 'local');
+      for (const store of stores.filter((name) => name !== 'identity'))
+        assert.deepEqual(await DB.getAll(store), []);
       // Simulate another tab deleting the database without using BroadcastChannel.
       await request(indexedDB.deleteDatabase(databaseName));
       assert.equal(Vault.isUnlocked(), false);

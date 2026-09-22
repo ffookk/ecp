@@ -15,6 +15,7 @@ export interface Contact {
   bundle: string;
   name: string;
   verified: boolean;
+  saveHistory?: boolean;
   archived: boolean;
   lastReadTimestamp: number;
 }

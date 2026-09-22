@@ -84,6 +84,7 @@ export async function createProtocolLab(t) {
       'crypto',
       'codec',
       'identity',
+      'identity-material',
       'mutex',
       'ratchet',
     ]) {
@@ -110,6 +111,10 @@ export async function createProtocolLab(t) {
         ].map(load),
       );
     if (snapshot) storage.DB.restore(snapshot);
+    else {
+      const { createIdentityMaterial } = await load('identity-material');
+      await storage.DB.put('identity', createIdentityMaterial());
+    }
     const local = await identity.getLocalIdentity();
     const publicBytes = identity.serializeIdentityPublic(local);
     return {
@@ -132,6 +137,7 @@ export async function createProtocolLab(t) {
       bundle: b.bundle,
       name: 'Test peer',
       verified,
+      saveHistory: true,
       archived: false,
       lastReadTimestamp: 0,
     });

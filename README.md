@@ -7,7 +7,7 @@ A security-focused fork of [James Liu's E2EE Clipboard Protocol](https://github.
 ## Compatibility and current status
 
 - This fork uses the incompatible **v3** wire format: `e2e3:` envelopes, `E2E3` packet magic, and protocol version `3`.
-- Existing v2 encrypted vaults, identities and verified contacts are retained. Identity fingerprints do not change. Existing v2 channels cannot send or accept v3 packets: upgrade both participants, then explicitly use **Wipe Channel State** on both sides before a new handshake. Wiping deletes that peer's local history; the upgrade itself does not. v1 plaintext identities and history are never imported automatically.
+- Existing v2 encrypted vaults, identities and verified contacts are retained. This build adds an encrypted identity binding to the password verifier on the first successful unlock of an intact older vault; use this build in every tab after upgrading. Older builds cannot unlock the upgraded verifier. Missing or corrupt identity records stop unlock without generating replacement keys. Identity fingerprints do not change. Existing v2 channels cannot send or accept v3 packets: upgrade both participants, then explicitly use **Wipe Channel State** on both sides before a new handshake. Wiping deletes that peer's local history; the upgrade itself does not. v1 plaintext identities and history are never imported automatically.
 - There is no built-in backup, export/import, passphrase change, or recovery mechanism. Losing the passphrase, clearing browser storage, losing the browser profile, or browser storage eviction can permanently lose the identity and history.
 - Do not clone or restore an active session database. Restoring or simultaneously using copies can repeat ratchet keys, counters and replay history. Random wire nonces and AES-256-GCM-SIV mitigate nonce-reuse damage but do not authenticate snapshot freshness or make cloning safe. Use fresh identities and newly verified channels after a profile restore; vault encryption cannot establish the freshness of an entire valid database snapshot.
 - The implementation remains subject to independent protocol review and further hardening. The software and tests are not a security certification.
@@ -56,9 +56,19 @@ The decoded input envelope is limited to 1 MiB, including protocol overhead. The
 
 To restart a channel, use **Wipe Channel State** on both sides before starting a new handshake. This deletes that peer's local session and message history while retaining the contact and handshake replay records. An incoming INIT cannot silently replace an active channel.
 
+## Message history defaults
+
+New message text and media are **not saved to the vault by default**, including for existing contacts without an explicit saving preference. Ratchet state and replay protection still persist and commit before a result is returned. Temporary messages are visible only in the tab that sent or imported them, until that tab locks, reloads, closes, or evicts old messages at its 100-message / 8 MiB content budget. The budget counts retained string contents and scalar fields, not total browser heap usage. There is no cross-tab plaintext synchronization.
+
+To keep future messages, choose **Peer Options → Message History → Save new messages for this peer in the encrypted vault**. This is a local preference; it does not control the recipient's storage. Each send/receive reads the current preference inside the origin-wide state lock. Turning saving on does not save earlier temporary messages. Turning it off preserves existing saved records. Saved history is readable by anyone who can unlock the vault, regardless of ratchet key deletion.
+
+**Clear all local history for this peer** explicitly deletes that peer's saved messages across all channels and clears temporary views in active tabs through the vault notification channel. It preserves the current channel, contact, replay protection and saving preference. Disabling saving or installing the upgrade never silently deletes existing history. Logical deletion cannot erase recipient copies, browser/OS backups, decoded buffers or forensic remnants.
+
+The page requests that browser spellchecking, autocorrection and translation avoid its sensitive inputs/content. Browser preferences, extensions, operating-system input services and user-invoked translation can override or operate outside these page controls.
+
 ## Local vault and locking
 
-Identity private keys, contact details, ratchet state, message text/media, and replay-record contents are encrypted in IndexedDB using a passphrase-derived AES-256-GCM key. The vault uses PBKDF2-HMAC-SHA-256 with 600,000 iterations and a random 16-byte salt. Each encrypted write uses a fresh random 12-byte IV. Authentication binds each record to its vault, store, and public record identifiers.
+Identity private keys, contact details, ratchet state, explicitly saved message text/media, and replay-record contents are encrypted in IndexedDB using a passphrase-derived AES-256-GCM key. The vault uses PBKDF2-HMAC-SHA-256 with 600,000 iterations and a random 16-byte salt. Each encrypted write uses a fresh random 12-byte IV. Authentication binds each record to its vault, store, and public record identifiers.
 
 Encryption does **not** conceal the whole database structure. Primary keys and required query indices remain visible, including contact fingerprints, conversation IDs, message IDs and replay-record hashes. Store names, record counts, ciphertext sizes, IVs, and password-derivation metadata are also visible. A copied vault allows offline passphrase guesses; choose a strong passphrase.
 
@@ -92,7 +102,7 @@ The current implementation adds:
 
 The wire layout, key schedule and state transitions are implemented in [src/codec.ts](src/codec.ts), [src/ratchet.ts](src/ratchet.ts), and [src/crypto.ts](src/crypto.ts). The [v3 protocol review notes](docs/PROTOCOL.md) describe framing, key derivation and state boundaries for external review. Do not reuse the protocol as a cryptographic standard without separate design and implementation review.
 
-No blanket forward-secrecy, post-compromise recovery, quantum-security, anonymity, or non-repudiation guarantee is made. In particular, plaintext message history is retained inside the vault: an adversary who obtains the unlocked vault or its passphrase can read that retained history regardless of transport-key deletion.
+No blanket forward-secrecy, post-compromise recovery, quantum-security, anonymity, or non-repudiation guarantee is made. In particular, when plaintext message history has been explicitly saved inside the vault, an adversary who obtains the unlocked vault or its passphrase can read that retained history regardless of transport-key deletion.
 
 ## Hosting, transport, and clipboard boundaries
 

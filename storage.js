@@ -1,4 +1,5 @@
 import { withStateLock } from './locks.js';
+import { createIdentityMaterial, clearIdentityMaterial, identityBinding, validateLocalIdentity, } from './identity-material.js';
 const DATABASE = 'ECP_SECURE_DB_v2';
 const LEGACY_DATABASE = 'ECP_DB';
 const DATABASE_VERSION = 1;
@@ -19,6 +20,7 @@ let destroying;
 let key;
 let vaultId;
 let metadataStamp;
+let identityStamp;
 let epoch = 0;
 const activeTransactions = new Set();
 const channel = typeof BroadcastChannel === 'undefined'
@@ -28,12 +30,18 @@ channel?.unref?.();
 channel?.addEventListener('message', (event) => {
     if (event.data?.type === 'lock' || event.data?.type === 'destroy')
         invalidate();
+    if (event.data?.type === 'history-cleared' &&
+        key &&
+        event.data.vaultId === vaultId &&
+        typeof event.data.contactFp === 'string')
+        historyCleared(event.data.contactFp);
 });
 function invalidate() {
     epoch++;
     key = undefined;
     vaultId = undefined;
     metadataStamp = undefined;
+    identityStamp = undefined;
     for (const tx of activeTransactions) {
         try {
             tx.abort();
@@ -54,9 +62,9 @@ function ensureEpoch(expected) {
         throw locked();
 }
 function snapshot() {
-    if (!key || !vaultId || !metadataStamp)
+    if (!key || !vaultId || !metadataStamp || !identityStamp)
         throw locked();
-    return { key, epoch, vaultId, metadataStamp };
+    return { key, epoch, vaultId, metadataStamp, identityStamp };
 }
 function ensureActive(state) {
     ensureEpoch(state.epoch);
@@ -287,6 +295,67 @@ function stamp(m) {
         base64(m.ciphertext),
     ]);
 }
+function envelopeStamp(envelope) {
+    if (!envelope ||
+        envelope.schema !== SCHEMA ||
+        envelope.id !== 'local' ||
+        !bytes(envelope.iv, 12) ||
+        !bytes(envelope.ciphertext) ||
+        envelope.ciphertext.length < 16 ||
+        Object.keys(envelope).sort().join(',') !== 'ciphertext,id,iv,schema')
+        throw new Error('Invalid encrypted identity record.');
+    return JSON.stringify([
+        envelope.schema,
+        envelope.id,
+        base64(envelope.iv),
+        base64(envelope.ciphertext),
+    ]);
+}
+function identityMatches(envelope, expected) {
+    try {
+        return envelopeStamp(envelope) === expected;
+    }
+    catch {
+        return false;
+    }
+}
+function historyCleared(contactFp) {
+    if (typeof globalThis.dispatchEvent === 'function')
+        globalThis.dispatchEvent(new CustomEvent('ecp-history-cleared', { detail: { contactFp } }));
+}
+const LEGACY_VERIFIER = 'ecp-password-vault-v2';
+const BOUND_VERIFIER = 'ecp-password-vault-v2:identity-v1:';
+async function sealVerifier(metadata, newKey, binding) {
+    const plaintext = encoder.encode(BOUND_VERIFIER + binding);
+    try {
+        metadata.ciphertext = new Uint8Array(await cryptoApi().subtle.encrypt({
+            name: 'AES-GCM',
+            iv: metadata.iv,
+            additionalData: metaAAD(metadata),
+        }, newKey, plaintext));
+    }
+    finally {
+        plaintext.fill(0);
+    }
+}
+async function readIdentityEnvelope(before, metadata) {
+    const db = await openDatabase();
+    ensureEpoch(before);
+    const tx = db.transaction(['meta', 'identity'], 'readonly');
+    const done = completion(tx);
+    const [current, identity] = await Promise.all([
+        request(tx.objectStore('meta').get('vault')),
+        request(tx.objectStore('identity').get('local')),
+        done,
+    ]);
+    ensureEpoch(before);
+    validateMetadata(current);
+    if (stamp(current) !== stamp(metadata))
+        throw locked();
+    if (!identity)
+        throw new Error('Vault identity is missing or corrupt; refusing to replace it.');
+    return identity;
+}
 function base64(value) {
     let result = '';
     for (let i = 0; i < value.length; i += 0x8000)
@@ -405,8 +474,8 @@ function aad(store, fields, id) {
         fields.conversationId ?? null,
     ]));
 }
-async function seal(store, item, state) {
-    ensureActive(state);
+async function seal(store, item, state, assertAccess = () => ensureActive(state)) {
+    assertAccess();
     const fields = header(store, item);
     const iv = random(12);
     const plaintext = encoder.encode(JSON.stringify(encode(item)));
@@ -416,15 +485,15 @@ async function seal(store, item, state) {
             iv: iv,
             additionalData: aad(store, fields, state.vaultId),
         }, state.key, plaintext));
-        ensureActive(state);
+        assertAccess();
         return { schema: SCHEMA, ...fields, iv, ciphertext };
     }
     finally {
         plaintext.fill(0);
     }
 }
-async function unseal(store, envelope, state) {
-    ensureActive(state);
+async function unseal(store, envelope, state, assertAccess = () => ensureActive(state)) {
+    assertAccess();
     if (!envelope ||
         envelope.schema !== SCHEMA ||
         !bytes(envelope.iv, 12) ||
@@ -444,11 +513,11 @@ async function unseal(store, envelope, state) {
             iv: envelope.iv,
             additionalData: aad(store, fields, state.vaultId),
         }, state.key, envelope.ciphertext));
-        ensureActive(state);
+        assertAccess();
         const item = decode(JSON.parse(decoder.decode(plaintext)));
         if (JSON.stringify(header(store, item)) !== JSON.stringify(fields))
             throw new Error('Vault record key mismatch');
-        ensureActive(state);
+        assertAccess();
         return item;
     }
     finally {
@@ -458,14 +527,21 @@ async function unseal(store, envelope, state) {
 async function transaction(stores, mode, state, action) {
     const db = await openDatabase();
     ensureActive(state);
-    const tx = db.transaction([...new Set(['meta', ...stores])], mode);
+    const tx = db.transaction([...new Set(['meta', 'identity', ...stores])], mode);
     const done = completion(tx, state);
     try {
-        const metadata = await request(tx.objectStore('meta').get('vault'));
+        const [metadata, identity] = await Promise.all([
+            request(tx.objectStore('meta').get('vault')),
+            request(tx.objectStore('identity').get('local')),
+        ]);
         validateMetadata(metadata);
         if (metadata.vaultId !== state.vaultId ||
             stamp(metadata) !== state.metadataStamp)
             throw locked();
+        if (!identityMatches(identity, state.identityStamp)) {
+            invalidate();
+            throw new Error('Vault identity changed or is missing; refusing to continue.');
+        }
         ensureActive(state);
         const result = await action(tx);
         await done;
@@ -522,6 +598,8 @@ export const DB = {
         await DB.putMany([[store, item]]);
     },
     putMany: async (entries) => {
+        if (entries.some(([store, item]) => store === 'identity' && item.id === 'local'))
+            throw new Error('The local identity can only be created with a new vault.');
         const state = snapshot();
         const encrypted = await Promise.all(entries.map(async ([store, item]) => [store, await seal(store, item, state)]));
         ensureActive(state);
@@ -533,6 +611,8 @@ export const DB = {
         });
     },
     delete: async (store, id) => {
+        if (store === 'identity' && id === 'local')
+            throw new Error('Delete the entire vault to remove the local identity.');
         const state = snapshot();
         await transaction([store], 'readwrite', state, (tx) => {
             tx.objectStore(store).delete(id);
@@ -545,6 +625,24 @@ export const DB = {
             await transaction(['messages'], 'readwrite', state, (tx) => deleteCursor(tx.objectStore('messages').index('conversationId'), conversationId));
         });
     },
+    clearPeerHistory: async (contactFp, assertCurrent = () => { }) => {
+        const state = snapshot();
+        await withStateLock(async () => {
+            ensureActive(state);
+            assertCurrent();
+            await transaction(['messages'], 'readwrite', state, (tx) => {
+                assertCurrent();
+                return deleteCursor(tx.objectStore('messages').index('contactFp'), contactFp);
+            });
+            ensureActive(state);
+            historyCleared(contactFp);
+            channel?.postMessage({
+                type: 'history-cleared',
+                contactFp,
+                vaultId: state.vaultId,
+            });
+        });
+    },
     deletePeer: async (contactFp, removeContact = true) => {
         const state = snapshot();
         await withStateLock(async () => {
@@ -554,6 +652,13 @@ export const DB = {
                 if (removeContact)
                     tx.objectStore('contacts').delete(contactFp);
                 await deleteCursor(tx.objectStore('messages').index('contactFp'), contactFp);
+            });
+            ensureActive(state);
+            historyCleared(contactFp);
+            channel?.postMessage({
+                type: 'history-cleared',
+                contactFp,
+                vaultId: state.vaultId,
             });
         });
     },
@@ -601,22 +706,50 @@ export const Vault = {
                 iv: random(12),
                 ciphertext: new Uint8Array(),
             };
-            metadata.ciphertext = new Uint8Array(await cryptoApi().subtle.encrypt({
-                name: 'AES-GCM',
-                iv: metadata.iv,
-                additionalData: metaAAD(metadata),
-            }, newKey, encoder.encode('ecp-password-vault-v2')));
+            const identity = createIdentityMaterial();
+            let encryptedIdentity;
+            try {
+                const provisional = {
+                    key: newKey,
+                    epoch: before,
+                    vaultId: metadata.vaultId,
+                    metadataStamp: '',
+                    identityStamp: '',
+                };
+                encryptedIdentity = await seal('identity', identity, provisional, () => ensureEpoch(before));
+                await sealVerifier(metadata, newKey, identityBinding(identity));
+            }
+            finally {
+                clearIdentityMaterial(identity);
+            }
             ensureEpoch(before);
             const db = await openDatabase();
             ensureEpoch(before);
-            const tx = db.transaction('meta', 'readwrite');
+            const tx = db.transaction(['meta', ...DATA_STORES], 'readwrite');
             const done = completion(tx);
-            tx.objectStore('meta').add(metadata);
-            await done;
+            try {
+                const counts = await Promise.all(['meta', ...DATA_STORES].map((name) => request(tx.objectStore(name).count())));
+                ensureEpoch(before);
+                if (counts.some((count) => count !== 0))
+                    throw new Error('Vault already contains data; refusing to initialize.');
+                tx.objectStore('meta').add(metadata);
+                tx.objectStore('identity').add(encryptedIdentity);
+                await done;
+            }
+            catch (error) {
+                try {
+                    tx.abort();
+                }
+                catch {
+                }
+                await done.catch(() => { });
+                throw error;
+            }
             ensureEpoch(before);
             key = newKey;
             vaultId = metadata.vaultId;
             metadataStamp = stamp(metadata);
+            identityStamp = envelopeStamp(encryptedIdentity);
         });
     },
     unlock: async (passphrase) => {
@@ -638,16 +771,76 @@ export const Vault = {
                 iv: metadata.iv,
                 additionalData: metaAAD(metadata),
             }, newKey, metadata.ciphertext));
-            if (decoder.decode(plaintext) !== 'ecp-password-vault-v2')
+            const verifier = decoder.decode(plaintext);
+            if (verifier !== LEGACY_VERIFIER &&
+                !new RegExp(`^${BOUND_VERIFIER}[A-Za-z0-9_-]{43}$`).test(verifier))
                 throw new Error('Invalid vault verifier');
             ensureEpoch(before);
-            const current = await readMetadata();
-            ensureEpoch(before);
-            if (!current || stamp(current) !== stamp(metadata))
-                throw locked();
-            key = newKey;
-            vaultId = metadata.vaultId;
-            metadataStamp = stamp(metadata);
+            const authenticateIdentity = async () => {
+                ensureEpoch(before);
+                const encryptedIdentity = await readIdentityEnvelope(before, metadata);
+                const provisional = {
+                    key: newKey,
+                    epoch: before,
+                    vaultId: metadata.vaultId,
+                    metadataStamp: stamp(metadata),
+                    identityStamp: envelopeStamp(encryptedIdentity),
+                };
+                const identity = await unseal('identity', encryptedIdentity, provisional, () => ensureEpoch(before));
+                let binding;
+                try {
+                    validateLocalIdentity(identity);
+                    binding = identityBinding(identity);
+                }
+                finally {
+                    for (const value of Object.values(identity ?? {}))
+                        if (value instanceof Uint8Array)
+                            value.fill(0);
+                }
+                const legacy = verifier === LEGACY_VERIFIER;
+                if (!legacy && verifier !== BOUND_VERIFIER + binding)
+                    throw new Error('Vault identity does not match its authenticated binding.');
+                const updated = legacy ? { ...metadata, iv: random(12) } : metadata;
+                if (legacy)
+                    await sealVerifier(updated, newKey, binding);
+                ensureEpoch(before);
+                const db = await openDatabase();
+                ensureEpoch(before);
+                const tx = db.transaction(['meta', 'identity'], legacy ? 'readwrite' : 'readonly');
+                const done = completion(tx);
+                try {
+                    const [current, currentIdentity] = await Promise.all([
+                        request(tx.objectStore('meta').get('vault')),
+                        request(tx.objectStore('identity').get('local')),
+                    ]);
+                    ensureEpoch(before);
+                    validateMetadata(current);
+                    if (stamp(current) !== stamp(metadata) ||
+                        !identityMatches(currentIdentity, provisional.identityStamp))
+                        throw locked();
+                    if (legacy)
+                        tx.objectStore('meta').put(updated);
+                    await done;
+                }
+                catch (error) {
+                    try {
+                        tx.abort();
+                    }
+                    catch {
+                    }
+                    await done.catch(() => { });
+                    throw error;
+                }
+                ensureEpoch(before);
+                key = newKey;
+                vaultId = updated.vaultId;
+                metadataStamp = stamp(updated);
+                identityStamp = provisional.identityStamp;
+            };
+            if (verifier === LEGACY_VERIFIER)
+                await withStateLock(authenticateIdentity);
+            else
+                await authenticateIdentity();
         }
         finally {
             plaintext?.fill(0);

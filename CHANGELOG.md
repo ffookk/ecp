@@ -2,6 +2,15 @@
 
 Changes below describe this experimental fork of [jamesliu96/ecp](https://github.com/jamesliu96/ecp). They do not describe an upstream release or an independent security certification.
 
+## 1.3.0 — Unreleased
+
+- Create vault metadata and local identity atomically; stop on missing or corrupt identity instead of silently generating replacement keys. Authenticate identity material in the verifier, validate it before unlocking, and pin the identity envelope during storage transactions.
+- Upgrade intact legacy verifiers without changing their identity or data records. Old builds cannot unlock the upgraded verifier; use this build in every tab. Incomplete older initialization is rejected without automatic repair.
+- Make new plaintext message history opt-in per peer. Keep default messages only in bounded, tab-local memory until lock/reload/close/eviction while still durably advancing the ratchet.
+- Add explicit history preferences and all-channel peer-history clearing. Preserve old saved history until explicit deletion, and preserve session/replay state when clearing history.
+- Request no spellchecking, autocorrection or translation for sensitive content; correct an inherited broad post-quantum UI claim and repair protocol derivation documentation.
+- Add synthetic identity-corruption, creation-abort, legacy-upgrade, policy, transient-history and browser lifecycle regressions. These changes do not replace independent protocol and application review.
+
 ## 1.2.0 — Unreleased
 
 ### Wire v3 and snapshot misuse resistance
