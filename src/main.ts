@@ -1372,6 +1372,7 @@ UI.$<HTMLFormElement>('#vault-form').onsubmit = async (event) => {
   vaultFormPending = true;
   updateVaultControls();
   UI.$('#vault-error').textContent = '';
+  let routeGeneration: number | undefined;
   try {
     if (newVault && passphrase !== confirmed)
       throw new Error('Passphrases do not match.');
@@ -1384,7 +1385,7 @@ UI.$<HTMLFormElement>('#vault-form').onsubmit = async (event) => {
     vaultScreenSeq++;
     UI.$('#vault-screen').classList.add('hidden');
     UI.$('#app-root').classList.remove('hidden');
-    await handleRoute();
+    routeGeneration = uiGeneration;
   } catch (error) {
     UI.$('#vault-error').textContent =
       error instanceof Error && error.message
@@ -1393,6 +1394,16 @@ UI.$<HTMLFormElement>('#vault-form').onsubmit = async (event) => {
   } finally {
     vaultFormPending = false;
     updateVaultControls();
+  }
+  // Authentication is complete before routing. A delayed old view must not
+  // keep a later lock screen busy or alter a newer authentication attempt.
+  if (routeGeneration !== undefined) {
+    try {
+      await handleRoute();
+    } catch {
+      if (routeGeneration === uiGeneration && Vault.isUnlocked())
+        UI.showToast('Unable to load this view. Select a peer or reload.');
+    }
   }
 };
 

@@ -636,3 +636,75 @@ test('missing persisted identity rejects normal UI unlock without creating repla
   });
   expect(result).toEqual({ count: 0, unlocked: false });
 });
+
+test('a locked post-unlock route cannot keep the next unlock pending or overwrite its view', async ({
+  page,
+}) => {
+  await openVault(page);
+  const [a] = await seedPeers(page, true);
+  await expect(page.locator('#chat-messages')).toContainText(
+    'Synthetic retained v2 history',
+  );
+  await page.evaluate(async () => (await import('/storage.js')).Vault.lock());
+  await expect(page.locator('#vault-submit')).toHaveText('Unlock');
+  await page.evaluate(async () => {
+    const { DB } = await import('/storage.js');
+    const getAll = DB.getAll.bind(DB);
+    let contactReads = 0;
+    DB.getAll = async (...args) => {
+      const result = await getAll(...args);
+      if (args[0] === 'contacts' && ++contactReads === 2) {
+        // The first sidebar read precedes showing the app. The second is the
+        // post-unlock route, whose completion must not own the unlock controls.
+        window.oldUnlockRouteHeld = true;
+        await new Promise((resolve) => {
+          window.releaseOldUnlockRoute = resolve;
+        });
+        // Model a canceled read reporting its failure after a newer unlock.
+        throw new Error('Synthetic stale route failure');
+      }
+      return result;
+    };
+    const form = document.querySelector('#vault-form');
+    const submit = form.onsubmit;
+    window.unlockActions = [];
+    form.onsubmit = function (event) {
+      const result = submit.call(this, event);
+      window.unlockActions.push(Promise.resolve(result));
+      return result;
+    };
+  });
+  await page.locator('#vault-password').fill(passphrase);
+  await page.locator('#vault-submit').click();
+  await expect
+    .poll(() => page.evaluate(() => window.oldUnlockRouteHeld))
+    .toBe(true);
+  await expect(page.locator('#app-root')).toBeVisible();
+  try {
+    await page.evaluate(async () => (await import('/storage.js')).Vault.lock());
+    await expect(page.locator('#vault-submit')).toHaveText('Unlock');
+    await expect(page.locator('#vault-password')).toBeEnabled();
+    await expect(page.locator('#vault-submit')).toBeEnabled();
+    await page.locator('#vault-password').fill(passphrase);
+    await page.locator('#vault-submit').click();
+    await page.evaluate(async () => await window.unlockActions[1]);
+    await expect(page.locator('#app-root')).toBeVisible();
+    await expect(page.locator('#chat-title')).toHaveText('Synthetic Peer A');
+    await expect(page.locator('#vault-error')).toBeEmpty();
+  } finally {
+    await page.evaluate(async () => {
+      window.releaseOldUnlockRoute();
+      await window.unlockActions[0];
+    });
+  }
+  await expect(page.locator('#app-root')).toBeVisible();
+  await expect(page.locator('#chat-title')).toHaveText('Synthetic Peer A');
+  await expect(page.locator('#chat-messages')).toContainText(
+    'Synthetic retained v2 history',
+  );
+  await expect(page.locator('#vault-error')).toBeEmpty();
+  const current = await readPeerState(page, a.fingerprint);
+  expect(current.contact.name).toBe('Synthetic Peer A');
+  expect(current.session.version).toBe(2);
+  expect(current.messages).toHaveLength(1);
+});

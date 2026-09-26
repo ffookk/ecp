@@ -6,6 +6,7 @@ Changes below describe this experimental fork of [jamesliu96/ecp](https://github
 
 - Enforce the five-minute inactivity deadline in the vault access layer using both wall-clock and monotonic elapsed time. Expired activity cannot renew access, background reads do not renew it, and clock rollback/nonfinite readings fail closed.
 - Recheck expiry on resumed focus, visibility and page lifecycle events, and before trusted input reaches sensitive controls. Browser execution suspension can still delay visual cleanup.
+- Finish authentication form busy state before post-unlock routing, so a delayed old view cannot disable a later unlock screen or modify a newer authentication attempt.
 - Cancel queued peer deletion or channel wipe when the confirmation modal or selected peer changes before the mutation begins. Preserve already committed transaction semantics.
 - Add synthetic elapsed-time, deferred-crypto, cross-tab locking and queued-cancellation regressions. These hardening checks do not establish natural browser sleep ordering or independent protocol assurance.
 - Keep wire v3, identity fingerprints and encrypted-vault schema unchanged. No user data migration is performed by this release.

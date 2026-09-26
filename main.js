@@ -1220,6 +1220,7 @@ UI.$('#vault-form').onsubmit = async (event) => {
     vaultFormPending = true;
     updateVaultControls();
     UI.$('#vault-error').textContent = '';
+    let routeGeneration;
     try {
         if (newVault && passphrase !== confirmed)
             throw new Error('Passphrases do not match.');
@@ -1234,7 +1235,7 @@ UI.$('#vault-form').onsubmit = async (event) => {
         vaultScreenSeq++;
         UI.$('#vault-screen').classList.add('hidden');
         UI.$('#app-root').classList.remove('hidden');
-        await handleRoute();
+        routeGeneration = uiGeneration;
     }
     catch (error) {
         UI.$('#vault-error').textContent =
@@ -1245,6 +1246,15 @@ UI.$('#vault-form').onsubmit = async (event) => {
     finally {
         vaultFormPending = false;
         updateVaultControls();
+    }
+    if (routeGeneration !== undefined) {
+        try {
+            await handleRoute();
+        }
+        catch {
+            if (routeGeneration === uiGeneration && Vault.isUnlocked())
+                UI.showToast('Unable to load this view. Select a peer or reload.');
+        }
     }
 };
 UI.$('#btn-delete-legacy').onclick = async () => {

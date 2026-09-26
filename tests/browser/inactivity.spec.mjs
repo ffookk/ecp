@@ -231,12 +231,28 @@ test('an asynchronous decrypt completing after expiry cannot publish its plainte
   await seedVisibleHistory(page);
   await page.evaluate(async (id) => {
     const { DB } = await import('/storage.js');
+    const message = await DB.get('messages', id);
+    if (!message) throw new Error('Synthetic message fixture is missing');
+    const delayedId = `${id}-delayed-only`;
+    // Route rendering may still be decrypting identity/contact/session records.
+    // Give this read its own record outside every displayed conversation so no
+    // unrelated UI read can consume its barrier.
+    await DB.put('messages', {
+      ...message,
+      id: delayedId,
+      conversationId: 'synthetic-isolated-delayed-conversation',
+    });
     const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
     let held = false;
     window.inactivityReadPublished = false;
+    window.inactivityReadSettled = false;
+    window.inactivityTargetDecrypts = 0;
     crypto.subtle.decrypt = async (...args) => {
       const plaintext = await decrypt(...args);
-      if (!held) {
+      const aad = JSON.parse(new TextDecoder().decode(args[0].additionalData));
+      const target = aad[3] === 'messages' && aad[4] === delayedId;
+      if (target) window.inactivityTargetDecrypts++;
+      if (target && !held) {
         held = true;
         window.inactivityDecryptHeld = true;
         await new Promise((resolve) => {
@@ -245,7 +261,7 @@ test('an asynchronous decrypt completing after expiry cannot publish its plainte
       }
       return plaintext;
     };
-    window.inactivityPendingRead = DB.get('messages', id)
+    window.inactivityPendingRead = DB.get('messages', delayedId)
       .then(
         () => {
           window.inactivityReadPublished = true;
@@ -254,12 +270,21 @@ test('an asynchronous decrypt completing after expiry cannot publish its plainte
         () => 'read rejected',
       )
       .finally(() => {
+        window.inactivityReadSettled = true;
         crypto.subtle.decrypt = decrypt;
       });
   }, messageId);
   await expect
     .poll(() => page.evaluate(() => window.inactivityDecryptHeld))
     .toBe(true);
+  // Verify the intended operation is still waiting before time advances.
+  expect(
+    await page.evaluate(() => ({
+      decrypts: window.inactivityTargetDecrypts,
+      published: window.inactivityReadPublished,
+      settled: window.inactivityReadSettled,
+    })),
+  ).toEqual({ decrypts: 1, published: false, settled: false });
   await shiftClock(page);
   const result = await page.evaluate(async () => {
     window.releaseInactivityDecrypt();

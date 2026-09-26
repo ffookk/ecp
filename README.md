@@ -76,6 +76,8 @@ Use **Global Settings → Lock now** to lock manually. The vault expires after f
 
 An unlocked page can access plaintext. JavaScript strings, browser internals, garbage collection, device memory, swap, and browser extensions prevent a guarantee of memory erasure. Clearing selected buffers and hiding the UI do not make a compromised or previously inspected device safe.
 
+Post-unlock view loading does not keep the authentication form busy. If the vault locks while an old view is still loading, that work cannot disable a later unlock or report an error into the new authentication attempt.
+
 ## Deletion, legacy data, and replay records
 
 **Delete Peer & History** removes that peer's contact, session, and all indexed local message history. Handshake replay records intentionally survive peer deletion and channel reset so that an old recorded INIT is not accepted as a new handshake. These records occupy storage over time; there is no automatic expiry policy. Their peer association is encrypted, while the replay identifier remains a visible record key.
