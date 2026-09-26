@@ -640,31 +640,8 @@ test('missing persisted identity rejects normal UI unlock without creating repla
 test('a locked post-unlock route cannot keep the next unlock pending or overwrite its view', async ({
   page,
 }) => {
-  await openVault(page);
-  const [a] = await seedPeers(page, true);
-  await expect(page.locator('#chat-messages')).toContainText(
-    'Synthetic retained v2 history',
-  );
-  await page.evaluate(async () => (await import('/storage.js')).Vault.lock());
-  await expect(page.locator('#vault-submit')).toHaveText('Unlock');
-  await page.evaluate(async () => {
-    const { DB } = await import('/storage.js');
-    const getAll = DB.getAll.bind(DB);
-    let contactReads = 0;
-    DB.getAll = async (...args) => {
-      const result = await getAll(...args);
-      if (args[0] === 'contacts' && ++contactReads === 2) {
-        // The first sidebar read precedes showing the app. The second is the
-        // post-unlock route, whose completion must not own the unlock controls.
-        window.oldUnlockRouteHeld = true;
-        await new Promise((resolve) => {
-          window.releaseOldUnlockRoute = resolve;
-        });
-        // Model a canceled read reporting its failure after a newer unlock.
-        throw new Error('Synthetic stale route failure');
-      }
-      return result;
-    };
+  await page.goto('/');
+  await page.evaluate(() => {
     const form = document.querySelector('#vault-form');
     const submit = form.onsubmit;
     window.unlockActions = [];
@@ -675,26 +652,111 @@ test('a locked post-unlock route cannot keep the next unlock pending or overwrit
     };
   });
   await page.locator('#vault-password').fill(passphrase);
+  await page.locator('#vault-confirm').fill(passphrase);
   await page.locator('#vault-submit').click();
+  // Finish creation's actual route before installing the targeted read barrier.
+  await page.evaluate(async () => await window.unlockActions[0]);
+  await expect(page.locator('#app-root')).toBeVisible();
+  const a = await syntheticIdentity(page);
+  await page.evaluate(async (peer) => {
+    const { DB } = await import('/storage.js');
+    const conversationId = 'synthetic-pending-unlock-conversation';
+    await DB.putMany([
+      [
+        'contacts',
+        {
+          fingerprint: peer.fingerprint,
+          bundle: peer.bundle,
+          name: 'Synthetic Peer A',
+          verified: true,
+          archived: false,
+          lastReadTimestamp: 0,
+        },
+      ],
+      [
+        'sessions',
+        {
+          contactFp: peer.fingerprint,
+          version: 2,
+          conversationId,
+          peerIdentity: peer.bundle,
+          DHs: {
+            sk: new Uint8Array(32).fill(1),
+            pk: new Uint8Array(32).fill(2),
+          },
+          RK: new Uint8Array(32).fill(3),
+          CKs: new Uint8Array(32).fill(4),
+          Ns: 1,
+          Nr: 0,
+          PN: 0,
+          state: 'ESTABLISHED',
+        },
+      ],
+      [
+        'messages',
+        {
+          id: 'synthetic-pending-unlock-message',
+          contactFp: peer.fingerprint,
+          conversationId,
+          isMe: true,
+          text: 'Synthetic retained v2 history',
+          timestamp: 1234,
+        },
+      ],
+    ]);
+    // Direct seeding leaves no asynchronous selection or hashchange task.
+    history.replaceState(null, '', location.pathname + location.search);
+  }, a);
+  await page.evaluate(async () => (await import('/storage.js')).Vault.lock());
+  await expect(page.locator('#vault-submit')).toHaveText('Unlock');
+  await page.evaluate(async () => {
+    const { DB } = await import('/storage.js');
+    const getAll = DB.getAll.bind(DB);
+    let armed = true;
+    DB.getAll = async (...args) => {
+      // The authentication sidebar starts with the app hidden. With the empty
+      // hash and settled setup, only the post-unlock route starts a visible read.
+      const hold =
+        armed &&
+        args[0] === 'contacts' &&
+        !document.querySelector('#app-root').classList.contains('hidden');
+      if (hold) armed = false;
+      const result = await getAll(...args);
+      if (hold) {
+        window.oldUnlockRouteHeld = true;
+        await new Promise((resolve) => {
+          window.releaseOldUnlockRoute = resolve;
+        });
+        // Model a canceled read reporting its failure after a newer unlock.
+        throw new Error('Synthetic stale route failure');
+      }
+      return result;
+    };
+  });
+  await page.locator('#vault-password').fill(passphrase);
+  await page.locator('#vault-submit').click();
+  await expect(page.locator('#app-root')).toBeVisible();
   await expect
     .poll(() => page.evaluate(() => window.oldUnlockRouteHeld))
     .toBe(true);
-  await expect(page.locator('#app-root')).toBeVisible();
   try {
     await page.evaluate(async () => (await import('/storage.js')).Vault.lock());
     await expect(page.locator('#vault-submit')).toHaveText('Unlock');
     await expect(page.locator('#vault-password')).toBeEnabled();
     await expect(page.locator('#vault-submit')).toBeEnabled();
+    await page.evaluate((fp) => {
+      history.replaceState(null, '', `#${fp}`);
+    }, a.fingerprint);
     await page.locator('#vault-password').fill(passphrase);
     await page.locator('#vault-submit').click();
-    await page.evaluate(async () => await window.unlockActions[1]);
+    await page.evaluate(async () => await window.unlockActions[2]);
     await expect(page.locator('#app-root')).toBeVisible();
     await expect(page.locator('#chat-title')).toHaveText('Synthetic Peer A');
     await expect(page.locator('#vault-error')).toBeEmpty();
   } finally {
     await page.evaluate(async () => {
       window.releaseOldUnlockRoute();
-      await window.unlockActions[0];
+      await window.unlockActions[1];
     });
   }
   await expect(page.locator('#app-root')).toBeVisible();
@@ -703,6 +765,9 @@ test('a locked post-unlock route cannot keep the next unlock pending or overwrit
     'Synthetic retained v2 history',
   );
   await expect(page.locator('#vault-error')).toBeEmpty();
+  await expect(page.locator('#toast-msg')).not.toContainText(
+    'Unable to load this view.',
+  );
   const current = await readPeerState(page, a.fingerprint);
   expect(current.contact.name).toBe('Synthetic Peer A');
   expect(current.session.version).toBe(2);
