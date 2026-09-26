@@ -19,6 +19,7 @@ const LEGACY_DATABASE = 'ECP_DB';
 const DATABASE_VERSION = 1;
 const SCHEMA = 2;
 const ITERATIONS = 600_000;
+const INACTIVITY_TIMEOUT_MS = 5 * 60_000;
 const DATA_STORES = [
   'identity',
   'contacts',
@@ -74,6 +75,10 @@ let vaultId: string | undefined;
 let metadataStamp: string | undefined;
 let identityStamp: string | undefined;
 let epoch = 0;
+type ActivityClock = { wall: number; monotonic: number };
+let lastActivity: ActivityClock | undefined;
+let lastObserved: ActivityClock | undefined;
+let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
 const activeTransactions = new Set<IDBTransaction>();
 const channel =
   typeof BroadcastChannel === 'undefined'
@@ -95,6 +100,10 @@ channel?.addEventListener('message', (event: MessageEvent) => {
 
 function invalidate(): void {
   epoch++;
+  clearTimeout(inactivityTimer);
+  inactivityTimer = undefined;
+  lastActivity = undefined;
+  lastObserved = undefined;
   key = undefined;
   vaultId = undefined;
   metadataStamp = undefined;
@@ -114,14 +123,73 @@ function invalidate(): void {
 function locked(): Error {
   return new Error('Vault is locked or its state changed');
 }
+function activityClock(): ActivityClock {
+  return { wall: Date.now(), monotonic: performance.now() };
+}
+function remainingInactivity(now: ActivityClock): number {
+  if (
+    !lastActivity ||
+    !lastObserved ||
+    !Number.isFinite(lastActivity.wall) ||
+    !Number.isFinite(lastActivity.monotonic) ||
+    !Number.isFinite(now.wall) ||
+    !Number.isFinite(now.monotonic) ||
+    now.wall < lastObserved.wall ||
+    now.monotonic < lastObserved.monotonic
+  )
+    return 0;
+  lastObserved = now;
+  // Wall time catches suspension on engines whose monotonic clock pauses.
+  // Monotonic time prevents a wall-clock adjustment from extending access.
+  return Math.max(
+    0,
+    INACTIVITY_TIMEOUT_MS -
+      Math.max(
+        now.wall - lastActivity.wall,
+        now.monotonic - lastActivity.monotonic,
+      ),
+  );
+}
+function lockVault(): void {
+  invalidate();
+  channel?.postMessage({ type: 'lock' });
+}
+function checkInactivity(now = activityClock()): void {
+  if (key && remainingInactivity(now) <= 0) lockVault();
+}
+function scheduleInactivity(): void {
+  clearTimeout(inactivityTimer);
+  inactivityTimer = undefined;
+  if (!key) return;
+  const remaining = remainingInactivity(activityClock());
+  if (remaining <= 0) {
+    lockVault();
+    return;
+  }
+  inactivityTimer = setTimeout(() => {
+    inactivityTimer = undefined;
+    // A callback can run early or late. Its delivery is not the authority for
+    // expiration, and rescheduling never counts as user activity.
+    checkInactivity();
+    scheduleInactivity();
+  }, remaining);
+  (inactivityTimer as unknown as { unref?: () => void }).unref?.();
+}
+function beginInactivity(): void {
+  lastActivity = lastObserved = activityClock();
+  scheduleInactivity();
+  if (!key) throw locked();
+}
 function ensureEpoch(expected: number): void {
   if (epoch !== expected) throw locked();
 }
 function snapshot(): Snapshot {
+  checkInactivity();
   if (!key || !vaultId || !metadataStamp || !identityStamp) throw locked();
   return { key, epoch, vaultId, metadataStamp, identityStamp };
 }
 function ensureActive(state: Snapshot): void {
+  checkInactivity();
   ensureEpoch(state.epoch);
   if (key !== state.key || vaultId !== state.vaultId) throw locked();
 }
@@ -857,15 +925,18 @@ export const DB = {
   deletePeer: async (
     contactFp: string,
     removeContact = true,
+    assertCurrent: () => void = () => {},
   ): Promise<void> => {
     const state = snapshot();
     await withStateLock(async () => {
       ensureActive(state);
+      assertCurrent();
       await transaction(
         ['contacts', 'sessions', 'messages'],
         'readwrite',
         state,
         async (tx) => {
+          assertCurrent();
           tx.objectStore('sessions').delete(contactFp);
           if (removeContact) tx.objectStore('contacts').delete(contactFp);
           await deleteCursor(
@@ -893,10 +964,12 @@ export const Vault = {
     return () => ensureActive(state);
   },
   status: async (): Promise<'new' | 'locked' | 'unlocked'> => {
+    checkInactivity();
     // A lock-event UI refresh must not reopen a database while its deletion is
     // still waiting for other connections to close.
     await destroying;
     const metadata = await readMetadata();
+    checkInactivity();
     if (!metadata) {
       if (key) invalidate();
       return 'new';
@@ -984,6 +1057,7 @@ export const Vault = {
       vaultId = metadata.vaultId;
       metadataStamp = stamp(metadata);
       identityStamp = envelopeStamp(encryptedIdentity);
+      beginInactivity();
     });
   },
   unlock: async (passphrase: string): Promise<void> => {
@@ -1088,6 +1162,7 @@ export const Vault = {
         vaultId = updated.vaultId;
         metadataStamp = stamp(updated);
         identityStamp = provisional.identityStamp;
+        beginInactivity();
       };
       // Current-format unlock is read-only and must not queue behind protocol
       // work whose old access generation this unlock has just invalidated.
@@ -1098,11 +1173,21 @@ export const Vault = {
       plaintext?.fill(0);
     }
   },
-  lock: (): void => {
-    invalidate();
-    channel?.postMessage({ type: 'lock' });
+  lock: lockVault,
+  // Only explicit user activity renews access. Reads, timer callbacks and
+  // background rendering must not keep an unattended vault alive.
+  touchActivity: (): boolean => {
+    const now = activityClock();
+    checkInactivity(now);
+    if (!key) return false;
+    lastActivity = lastObserved = now;
+    scheduleInactivity();
+    return Boolean(key);
   },
-  isUnlocked: (): boolean => Boolean(key && vaultId),
+  isUnlocked: (): boolean => {
+    checkInactivity();
+    return Boolean(key && vaultId);
+  },
   destroy: async (): Promise<void> => {
     if (destroying) return destroying;
     let finish!: () => void;

@@ -155,6 +155,50 @@ async function peerNames(page) {
   );
 }
 
+async function readPeerState(page, fingerprint) {
+  return page.evaluate(async (fp) => {
+    const { DB } = await import('/storage.js');
+    return {
+      contact: await DB.get('contacts', fp),
+      session: await DB.get('sessions', fp),
+      messages: await DB.getAllByIndex('messages', 'contactFp', fp),
+    };
+  }, fingerprint);
+}
+
+async function queueConfirmedAction(page, selector) {
+  await page.evaluate(() => {
+    window.heldStateLock = navigator.locks.request(
+      'ECP_SECURE_DB_v2:state',
+      () =>
+        new Promise((resolve) => {
+          window.stateLockHeld = true;
+          window.releaseStateLock = resolve;
+        }),
+    );
+  });
+  await expect.poll(() => page.evaluate(() => window.stateLockHeld)).toBe(true);
+  await observeClick(page, selector);
+  await page.locator(selector).click();
+  await expect
+    .poll(() =>
+      page.evaluate(async () =>
+        (await navigator.locks.query()).pending.some(
+          (lock) => lock.name === 'ECP_SECURE_DB_v2:state',
+        ),
+      ),
+    )
+    .toBe(true);
+}
+
+async function releaseConfirmedAction(page) {
+  await page.evaluate(async () => {
+    window.releaseStateLock();
+    await window.heldStateLock;
+    await window.observedAction;
+  });
+}
+
 test('a delayed initial rename read cannot open a modal for the previously selected peer', async ({
   page,
 }) => {
@@ -345,6 +389,74 @@ test('a stored v2 channel remains readable and disabled until explicit channel w
   expect(after.contact).toEqual(before.contact);
 });
 
+test('a confirmed peer deletion queued on the state lock expires when its modal is canceled', async ({
+  page,
+}) => {
+  await openVault(page);
+  const [a] = await seedPeers(page, true);
+  await expect(page.locator('#chat-messages')).toContainText(
+    'Synthetic retained v2 history',
+  );
+  const before = await readPeerState(page, a.fingerprint);
+  await page.locator('#btn-peer-menu').click();
+  await page.locator('#btn-delete-contact').click();
+  await queueConfirmedAction(page, '#btn-confirm-del');
+  try {
+    await page.locator('#btn-cancel-del').click();
+    await expect(page.locator('#modal-overlay')).toBeHidden();
+    await page.locator('#btn-global-settings').click();
+    await expect(page.locator('#modal-container')).toContainText(
+      'Encrypted local vault',
+    );
+  } finally {
+    await releaseConfirmedAction(page);
+  }
+  expect(await readPeerState(page, a.fingerprint)).toEqual(before);
+  await expect(page.locator('#chat-title')).toHaveText('Synthetic Peer A');
+  await expect(page.locator('#chat-messages')).toContainText(
+    'Synthetic retained v2 history',
+  );
+  await expect(page.locator('#modal-overlay')).toBeVisible();
+  await expect(page.locator('#modal-container')).toContainText(
+    'Encrypted local vault',
+  );
+  await expect(page.locator('#toast-msg')).not.toContainText('Peer deleted.');
+});
+
+test('a confirmed channel wipe queued on the state lock expires after peer navigation', async ({
+  page,
+}) => {
+  await openVault(page);
+  const [a, b] = await seedPeers(page, true);
+  await expect(page.locator('#chat-messages')).toContainText(
+    'Synthetic retained v2 history',
+  );
+  const before = await readPeerState(page, a.fingerprint);
+  await page.locator('#btn-peer-menu').click();
+  await page.locator('#btn-reset-session').click();
+  await queueConfirmedAction(page, '#btn-confirm-wipe');
+  try {
+    // Navigation invalidates A's modal before B's last-read update can acquire
+    // the held state lock. Wait for that invalidation before releasing it.
+    await page.evaluate((fp) => {
+      location.hash = `#${fp}`;
+    }, b.fingerprint);
+    await expect(page.locator('#modal-overlay')).toBeHidden();
+  } finally {
+    await releaseConfirmedAction(page);
+  }
+  expect(await readPeerState(page, a.fingerprint)).toEqual(before);
+  await expect(page.locator('#chat-title')).toHaveText('Synthetic Peer B');
+  await expect(page.locator('#chat-status-text')).toHaveText('Idle');
+  await expect(page.locator('#chat-messages')).not.toContainText(
+    'Synthetic retained v2 history',
+  );
+  await expect(page.locator('#modal-overlay')).toBeHidden();
+  await expect(page.locator('#toast-msg')).not.toContainText(
+    'Channel state wiped.',
+  );
+});
+
 test('identity reads queued before lock expire while the original keys survive unlock', async ({
   page,
 }) => {
@@ -523,4 +635,76 @@ test('missing persisted identity rejects normal UI unlock without creating repla
     return { count, unlocked: Vault.isUnlocked() };
   });
   expect(result).toEqual({ count: 0, unlocked: false });
+});
+
+test('a locked post-unlock route cannot keep the next unlock pending or overwrite its view', async ({
+  page,
+}) => {
+  await openVault(page);
+  const [a] = await seedPeers(page, true);
+  await expect(page.locator('#chat-messages')).toContainText(
+    'Synthetic retained v2 history',
+  );
+  await page.evaluate(async () => (await import('/storage.js')).Vault.lock());
+  await expect(page.locator('#vault-submit')).toHaveText('Unlock');
+  await page.evaluate(async () => {
+    const { DB } = await import('/storage.js');
+    const getAll = DB.getAll.bind(DB);
+    let contactReads = 0;
+    DB.getAll = async (...args) => {
+      const result = await getAll(...args);
+      if (args[0] === 'contacts' && ++contactReads === 2) {
+        // The first sidebar read precedes showing the app. The second is the
+        // post-unlock route, whose completion must not own the unlock controls.
+        window.oldUnlockRouteHeld = true;
+        await new Promise((resolve) => {
+          window.releaseOldUnlockRoute = resolve;
+        });
+        // Model a canceled read reporting its failure after a newer unlock.
+        throw new Error('Synthetic stale route failure');
+      }
+      return result;
+    };
+    const form = document.querySelector('#vault-form');
+    const submit = form.onsubmit;
+    window.unlockActions = [];
+    form.onsubmit = function (event) {
+      const result = submit.call(this, event);
+      window.unlockActions.push(Promise.resolve(result));
+      return result;
+    };
+  });
+  await page.locator('#vault-password').fill(passphrase);
+  await page.locator('#vault-submit').click();
+  await expect
+    .poll(() => page.evaluate(() => window.oldUnlockRouteHeld))
+    .toBe(true);
+  await expect(page.locator('#app-root')).toBeVisible();
+  try {
+    await page.evaluate(async () => (await import('/storage.js')).Vault.lock());
+    await expect(page.locator('#vault-submit')).toHaveText('Unlock');
+    await expect(page.locator('#vault-password')).toBeEnabled();
+    await expect(page.locator('#vault-submit')).toBeEnabled();
+    await page.locator('#vault-password').fill(passphrase);
+    await page.locator('#vault-submit').click();
+    await page.evaluate(async () => await window.unlockActions[1]);
+    await expect(page.locator('#app-root')).toBeVisible();
+    await expect(page.locator('#chat-title')).toHaveText('Synthetic Peer A');
+    await expect(page.locator('#vault-error')).toBeEmpty();
+  } finally {
+    await page.evaluate(async () => {
+      window.releaseOldUnlockRoute();
+      await window.unlockActions[0];
+    });
+  }
+  await expect(page.locator('#app-root')).toBeVisible();
+  await expect(page.locator('#chat-title')).toHaveText('Synthetic Peer A');
+  await expect(page.locator('#chat-messages')).toContainText(
+    'Synthetic retained v2 history',
+  );
+  await expect(page.locator('#vault-error')).toBeEmpty();
+  const current = await readPeerState(page, a.fingerprint);
+  expect(current.contact.name).toBe('Synthetic Peer A');
+  expect(current.session.version).toBe(2);
+  expect(current.messages).toHaveLength(1);
 });

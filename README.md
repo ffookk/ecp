@@ -72,13 +72,17 @@ Identity private keys, contact details, ratchet state, explicitly saved message 
 
 Encryption does **not** conceal the whole database structure. Primary keys and required query indices remain visible, including contact fingerprints, conversation IDs, message IDs and replay-record hashes. Store names, record counts, ciphertext sizes, IVs, and password-derivation metadata are also visible. A copied vault allows offline passphrase guesses; choose a strong passphrase.
 
-Use **Global Settings → Lock now** to lock manually. The page also schedules a lock after five minutes without the pointer/keyboard activity it observes and locks on `pagehide`. Locking removes the application's current vault-key reference, aborts tracked transactions, clears displayed conversation data, and broadcasts a lock request to other tabs when BroadcastChannel is available. Browser suspension and timer throttling can delay automatic locking; use the manual control before leaving sensitive content unattended.
+Use **Global Settings → Lock now** to lock manually. The vault expires after five minutes without trusted pointer/keyboard activity observed in that tab and locks on `pagehide`. Elapsed time is checked at storage/access boundaries, before activity can renew the deadline, and when focus or page visibility returns. Background reads and rendering do not renew access. Wall time and monotonic elapsed time are both checked; backwards or invalid clock readings lock conservatively. Locking removes the application's current vault-key reference, aborts tracked transactions, clears displayed conversation data, and broadcasts a lock request to other tabs when BroadcastChannel is available. Browser suspension and timer throttling can still delay the callback and screen clearing while JavaScript is not running. On resumption, expired access is rejected instead of granting another five minutes. Use the manual control before leaving sensitive content unattended.
 
 An unlocked page can access plaintext. JavaScript strings, browser internals, garbage collection, device memory, swap, and browser extensions prevent a guarantee of memory erasure. Clearing selected buffers and hiding the UI do not make a compromised or previously inspected device safe.
+
+Post-unlock view loading does not keep the authentication form busy. If the vault locks while an old view is still loading, that work cannot disable a later unlock or report an error into the new authentication attempt.
 
 ## Deletion, legacy data, and replay records
 
 **Delete Peer & History** removes that peer's contact, session, and all indexed local message history. Handshake replay records intentionally survive peer deletion and channel reset so that an old recorded INIT is not accepted as a new handshake. These records occupy storage over time; there is no automatic expiry policy. Their peer association is encrypted, while the replay identifier remains a visible record key.
+
+A peer deletion or channel wipe waiting for the state lock is canceled if its confirmation modal closes or the selection changes before the deletion transaction starts. Cancellation cannot undo a transaction that has already committed.
 
 **Delete all local data** destroys the v2 vault, including its identity and replay records. This operation cannot be undone by the application.
 

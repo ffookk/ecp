@@ -5,6 +5,7 @@ const LEGACY_DATABASE = 'ECP_DB';
 const DATABASE_VERSION = 1;
 const SCHEMA = 2;
 const ITERATIONS = 600_000;
+const INACTIVITY_TIMEOUT_MS = 5 * 60_000;
 const DATA_STORES = [
     'identity',
     'contacts',
@@ -22,6 +23,9 @@ let vaultId;
 let metadataStamp;
 let identityStamp;
 let epoch = 0;
+let lastActivity;
+let lastObserved;
+let inactivityTimer;
 const activeTransactions = new Set();
 const channel = typeof BroadcastChannel === 'undefined'
     ? undefined
@@ -38,6 +42,10 @@ channel?.addEventListener('message', (event) => {
 });
 function invalidate() {
     epoch++;
+    clearTimeout(inactivityTimer);
+    inactivityTimer = undefined;
+    lastActivity = undefined;
+    lastObserved = undefined;
     key = undefined;
     vaultId = undefined;
     metadataStamp = undefined;
@@ -57,16 +65,66 @@ function invalidate() {
 function locked() {
     return new Error('Vault is locked or its state changed');
 }
+function activityClock() {
+    return { wall: Date.now(), monotonic: performance.now() };
+}
+function remainingInactivity(now) {
+    if (!lastActivity ||
+        !lastObserved ||
+        !Number.isFinite(lastActivity.wall) ||
+        !Number.isFinite(lastActivity.monotonic) ||
+        !Number.isFinite(now.wall) ||
+        !Number.isFinite(now.monotonic) ||
+        now.wall < lastObserved.wall ||
+        now.monotonic < lastObserved.monotonic)
+        return 0;
+    lastObserved = now;
+    return Math.max(0, INACTIVITY_TIMEOUT_MS -
+        Math.max(now.wall - lastActivity.wall, now.monotonic - lastActivity.monotonic));
+}
+function lockVault() {
+    invalidate();
+    channel?.postMessage({ type: 'lock' });
+}
+function checkInactivity(now = activityClock()) {
+    if (key && remainingInactivity(now) <= 0)
+        lockVault();
+}
+function scheduleInactivity() {
+    clearTimeout(inactivityTimer);
+    inactivityTimer = undefined;
+    if (!key)
+        return;
+    const remaining = remainingInactivity(activityClock());
+    if (remaining <= 0) {
+        lockVault();
+        return;
+    }
+    inactivityTimer = setTimeout(() => {
+        inactivityTimer = undefined;
+        checkInactivity();
+        scheduleInactivity();
+    }, remaining);
+    inactivityTimer.unref?.();
+}
+function beginInactivity() {
+    lastActivity = lastObserved = activityClock();
+    scheduleInactivity();
+    if (!key)
+        throw locked();
+}
 function ensureEpoch(expected) {
     if (epoch !== expected)
         throw locked();
 }
 function snapshot() {
+    checkInactivity();
     if (!key || !vaultId || !metadataStamp || !identityStamp)
         throw locked();
     return { key, epoch, vaultId, metadataStamp, identityStamp };
 }
 function ensureActive(state) {
+    checkInactivity();
     ensureEpoch(state.epoch);
     if (key !== state.key || vaultId !== state.vaultId)
         throw locked();
@@ -643,11 +701,13 @@ export const DB = {
             });
         });
     },
-    deletePeer: async (contactFp, removeContact = true) => {
+    deletePeer: async (contactFp, removeContact = true, assertCurrent = () => { }) => {
         const state = snapshot();
         await withStateLock(async () => {
             ensureActive(state);
+            assertCurrent();
             await transaction(['contacts', 'sessions', 'messages'], 'readwrite', state, async (tx) => {
+                assertCurrent();
                 tx.objectStore('sessions').delete(contactFp);
                 if (removeContact)
                     tx.objectStore('contacts').delete(contactFp);
@@ -669,8 +729,10 @@ export const Vault = {
         return () => ensureActive(state);
     },
     status: async () => {
+        checkInactivity();
         await destroying;
         const metadata = await readMetadata();
+        checkInactivity();
         if (!metadata) {
             if (key)
                 invalidate();
@@ -750,6 +812,7 @@ export const Vault = {
             vaultId = metadata.vaultId;
             metadataStamp = stamp(metadata);
             identityStamp = envelopeStamp(encryptedIdentity);
+            beginInactivity();
         });
     },
     unlock: async (passphrase) => {
@@ -836,6 +899,7 @@ export const Vault = {
                 vaultId = updated.vaultId;
                 metadataStamp = stamp(updated);
                 identityStamp = provisional.identityStamp;
+                beginInactivity();
             };
             if (verifier === LEGACY_VERIFIER)
                 await withStateLock(authenticateIdentity);
@@ -846,11 +910,20 @@ export const Vault = {
             plaintext?.fill(0);
         }
     },
-    lock: () => {
-        invalidate();
-        channel?.postMessage({ type: 'lock' });
+    lock: lockVault,
+    touchActivity: () => {
+        const now = activityClock();
+        checkInactivity(now);
+        if (!key)
+            return false;
+        lastActivity = lastObserved = now;
+        scheduleInactivity();
+        return Boolean(key);
     },
-    isUnlocked: () => Boolean(key && vaultId),
+    isUnlocked: () => {
+        checkInactivity();
+        return Boolean(key && vaultId);
+    },
     destroy: async () => {
         if (destroying)
             return destroying;
