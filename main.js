@@ -832,7 +832,7 @@ UI.$('#btn-delete-contact').onclick = async () => {
         UI.$('#btn-confirm-del').onclick = async () => {
             try {
                 assertModal();
-                await DB.deletePeer(targetFp);
+                await DB.deletePeer(targetFp, true, assertModal);
                 transientHistory.clearPeer(targetFp);
                 assertModal();
                 UI.closeModal();
@@ -877,7 +877,7 @@ UI.$('#btn-reset-session').onclick = async () => {
         UI.$('#btn-confirm-wipe').onclick = async () => {
             try {
                 assertModal();
-                await DB.deletePeer(targetFp, false);
+                await DB.deletePeer(targetFp, false, assertModal);
                 transientHistory.clearPeer(targetFp);
                 assertModal();
                 UI.closeModal();
@@ -1084,7 +1084,6 @@ async function handleRoute() {
 }
 addEventListener('hashchange', handleRoute);
 let uiGeneration = 0;
-let lockTimer;
 let newVault = true;
 let vaultScreenSeq = 0;
 let vaultScreenReady = false;
@@ -1112,13 +1111,20 @@ async function updateContact(fp, update, assertContext = captureUi()) {
         assertContext();
     });
 }
-function armAutoLock() {
-    clearTimeout(lockTimer);
-    if (Vault.isUnlocked())
-        lockTimer = setTimeout(() => Vault.lock(), 5 * 60_000);
-}
 for (const name of ['pointerdown', 'keydown'])
-    addEventListener(name, armAutoLock, { passive: true });
+    addEventListener(name, (event) => {
+        if (!event.isTrusted)
+            return;
+        const wasVisible = !UI.$('#app-root').classList.contains('hidden');
+        if (!Vault.touchActivity() && wasVisible) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+    }, { capture: true });
+for (const name of ['focus', 'pageshow'])
+    addEventListener(name, () => Vault.isUnlocked());
+for (const name of ['visibilitychange', 'resume'])
+    document.addEventListener(name, () => Vault.isUnlocked());
 addEventListener('pagehide', () => {
     transientHistory.clear();
     Vault.lock();
@@ -1139,7 +1145,6 @@ addEventListener('ecp-vault-locked', () => {
     transientHistory.clear();
     uiGeneration++;
     renderSeq++;
-    clearTimeout(lockTimer);
     selectionSeq++;
     cancelMediaReads();
     delete State.currentContactFp;
@@ -1230,7 +1235,6 @@ UI.$('#vault-form').onsubmit = async (event) => {
         UI.$('#vault-screen').classList.add('hidden');
         UI.$('#app-root').classList.remove('hidden');
         await handleRoute();
-        armAutoLock();
     }
     catch (error) {
         UI.$('#vault-error').textContent =

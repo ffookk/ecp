@@ -63,6 +63,10 @@ Do not clone or restore active session databases: this can repeat ratchet keys,
 counters and replay history. Protocol v3 uses fresh message nonces and AES-GCM-SIV
 to mitigate nonce misuse; these measures do not establish snapshot freshness.
 Use fresh identities and newly verified channels after a profile restore.
+The vault checks its five-minute inactivity deadline before access and renewal,
+including after delayed timers and resumed UI events. Background reads do not
+renew it. Browser suspension can still delay screen clearing; lock manually
+before leaving private content unattended.
 An unlocked page can access plaintext. Clipboard history, endpoint compromise,
 traffic metadata and secure deletion are outside the vault's protection.
 
