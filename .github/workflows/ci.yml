@@ -12,6 +12,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    outputs:
+      archive-id: ${{ steps.archive.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -42,12 +44,94 @@ jobs:
       - name: Test Chromium, Firefox and WebKit without collecting private artifacts
         run: npx playwright test
       - name: Prepare the offline local client package
-        run: node scripts/package.mjs
-      - name: Upload only the explicit static client package
+        run: |
+          node scripts/package.mjs
+          node scripts/archive.mjs
+      - name: Upload only the explicit local client archive
+        id: archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: experimental-static-package
-          path: build-package/
+          name: experimental-local-client
+          path: build-release/ecp-local-client.tar
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false
+
+  attest:
+    needs: verify
+    # Pull requests, branch pushes and manual runs never receive signing rights.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'ffookk/ecp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # This job does not check out or execute project/dependency code. Download
+      # the producing artifact from this same run, after verify has passed.
+      - name: Require the producing artifact identity
+        shell: bash
+        env:
+          ARCHIVE_ID: ${{ needs.verify.outputs.archive-id }}
+        run: '[[ "$ARCHIVE_ID" =~ ^[1-9][0-9]*$ ]]'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify.outputs.archive-id }}
+          path: release
+          merge-multiple: true
+      - name: Attest the exact archive
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release/ecp-local-client.tar
+          create-storage-record: false
+      - name: Verify provenance and reject mismatched trust inputs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cp -- "$BUNDLE_PATH" release/ecp-local-client.tar.sigstore.json
+          policy=(--bundle release/ecp-local-client.tar.sigstore.json
+            --repo ffookk/ecp
+            --signer-workflow ffookk/ecp/.github/workflows/ci.yml
+            --source-ref refs/heads/main
+            --source-digest "$EXPECTED_COMMIT"
+            --deny-self-hosted-runners)
+          gh attestation verify release/ecp-local-client.tar "${policy[@]}"
+          # Test the real verifier and signed bundle, not a mocked signature.
+          for mismatch in \
+            '--repo=ffookk/ecp-untrusted' \
+            '--signer-workflow=ffookk/ecp/.github/workflows/untrusted.yml' \
+            '--source-ref=refs/heads/untrusted' \
+            '--source-digest=0000000000000000000000000000000000000000'; do
+            if gh attestation verify release/ecp-local-client.tar "${policy[@]}" "$mismatch" >/dev/null 2>&1; then
+              echo 'Mismatched provenance policy was accepted.'
+              exit 1
+            fi
+          done
+          cp release/ecp-local-client.tar "$RUNNER_TEMP/tampered-client.tar"
+          printf 'synthetic tamper' >> "$RUNNER_TEMP/tampered-client.tar"
+          if gh attestation verify "$RUNNER_TEMP/tampered-client.tar" "${policy[@]}" >/dev/null 2>&1; then
+            echo 'Tampered archive was accepted.'
+            exit 1
+          fi
+          printf '{}\n' > "$RUNNER_TEMP/invalid-bundle.json"
+          if gh attestation verify release/ecp-local-client.tar "${policy[@]}" --bundle "$RUNNER_TEMP/invalid-bundle.json" >/dev/null 2>&1; then
+            echo 'Malformed attestation was accepted.'
+            exit 1
+          fi
+          echo 'Verified archive; all six negative provenance checks rejected.'
+      - name: Upload only the verified archive and its public attestation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-local-client
+          path: |
+            release/ecp-local-client.tar
+            release/ecp-local-client.tar.sigstore.json
           if-no-files-found: error
           retention-days: 14
           include-hidden-files: false

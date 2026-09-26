@@ -2,6 +2,14 @@
 
 Changes below describe this experimental fork of [jamesliu96/ecp](https://github.com/jamesliu96/ecp). They do not describe an upstream release or an independent security certification.
 
+## 1.3.2
+
+- Produce a canonical USTAR archive from the package's verified inventory and captured bytes. Reject unsafe paths, links, special files, inventory/hash mismatches and privacy-rule matches before replacing the archive; omit host ownership and filesystem timestamps.
+- Add build provenance for successful protected-main pushes using GitHub OIDC and Sigstore, without maintaining a private release signing key. Restrict signing rights to a separate job that consumes the checked archive and never executes project or dependency code.
+- Verify the actual distributed bundle against the expected repository, workflow, branch and full source commit. Exercise six rejection cases using the real signed bundle and verifier. Publish only the archive and its public provenance bundle.
+- Document verification through independently trusted tooling before extraction, the external source-commit trust requirement, public provenance metadata, and the limits of build authenticity.
+- Preserve wire v3, vault schema, identity fingerprints and all application behavior. This packaging change performs no vault migration and is not an independent protocol audit.
+
 ## 1.3.1
 
 - Enforce the five-minute inactivity deadline in the vault access layer using both wall-clock and monotonic elapsed time. Expired activity cannot renew access, background reads do not renew it, and clock rollback/nonfinite readings fail closed.
