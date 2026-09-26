@@ -26,7 +26,7 @@ npm run dev
 
 Open [the local app](http://127.0.0.1:4173). `npm run check` runs TypeScript checking, a production build, and Node tests against the resulting code. `npm run dev` serves the existing `dist/` directory at `127.0.0.1:4173`; it is not a build watcher. After changing source files, build again with `npm run build` and reload the page.
 
-The build copies pinned Noble dependencies from the lockfile into local browser assets and writes `dist/SHA256SUMS.json`. These hashes help compare build artifacts; they are not a signed release attestation and do not authenticate a compromised build machine or hosting origin. Installing dependencies and running builds still requires trust in the selected source, package registry, lockfile, and local tooling.
+The build copies pinned Noble dependencies from the lockfile into local browser assets and writes `dist/SHA256SUMS.json`. These hashes help compare build artifacts; they do not authenticate a publisher. CI-built archives can additionally carry a signed provenance attestation as described below. Neither mechanism authenticates a compromised build machine or hosting origin. Installing dependencies and running builds still requires trust in the selected source, package registry, lockfile, and local tooling.
 
 **Building and testing do not publish anything.** There is no automatic GitHub Pages deployment. Review any hosting decision separately and serve only the intended built artifacts.
 
@@ -38,9 +38,13 @@ cd build-package
 node scripts/serve.mjs
 ```
 
-The package contains the static application, a Node-only loopback server, usage notes and checksum manifests. No npm installation or runtime network dependency is needed to run the generated package. Keep the same local origin and browser profile to access an existing vault; changing the port or origin creates a separate storage scope. This is not a vault backup.
+The package contains the static application, a Node-only loopback server, usage notes and checksum manifests. Packaging also creates `build-release/ecp-local-client.tar`: a deterministic, uncompressed USTAR archive of exactly the validated package files, with fixed ownership, permissions and timestamps. Local packaging does not sign or publish it. No npm installation or runtime network dependency is needed to run the generated package. Keep the same local origin and browser profile to access an existing vault; changing the port or origin creates a separate storage scope. This is not a vault backup.
 
-CI uploads the explicit `build-package/` directory after its checks. It does not upload browser profiles, clipboard contents, test traces or the whole workspace, and it does not deploy the app. Checksums detect changes only relative to a trusted manifest; they are not a publisher signature.
+CI uploads only that archive as `experimental-local-client` after its checks. Successful pushes to this fork's protected `main` additionally produce `verified-local-client`, containing the same archive and its Sigstore attestation bundle. Pull requests, other branches and manual runs do not sign packages. The isolated signing job does not execute package or dependency code; it verifies the exact bundle before uploading the two explicit files. CI does not upload browser profiles, clipboard contents, test traces or the whole workspace, and it does not deploy the app.
+
+**Before extracting or running a downloaded package, authenticate the archive with independently trusted GitHub CLI tooling and an externally selected full source commit.** Follow [Verifying downloaded packages](docs/VERIFYING_RELEASES.md). A neighboring checksum or a verifier supplied inside an unauthenticated package is not an independent trust anchor. A failed or unavailable provenance check must stop installation; rebuilding from reviewed source is a separate choice.
+
+Public-repository signing sends the archive digest and public repository/workflow/build metadata to GitHub and Sigstore, whose transparency record is public and persistent. It does not send a local vault, passphrase, clipboard or browser profile. Provenance verification can contact GitHub/Sigstore services and expose ordinary request metadata; running the already obtained local client has no such provenance network requirement. The proof identifies the selected build, not the safety of its code, the latest acceptable version, or an independently audited protocol.
 
 Before publishing, stage only intended project files and run `npm run privacy:check`. This checks the staged index, reachable Git history and commit metadata for common secret/path patterns and unintended files. New commit email addresses must use GitHub's noreply form; reviewed upstream history retains its original public authors. Pattern checks can miss unknown secret formats and cannot anonymize a public GitHub account.
 

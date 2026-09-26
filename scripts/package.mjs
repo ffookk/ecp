@@ -74,6 +74,12 @@ SHA256SUMS.json records the SHA-256 digest of every package payload file,
 including the build's nested manifest; the top-level manifest excludes itself.
 These hashes detect changes relative to this manifest. They are not signatures
 and do not establish the identity or trustworthiness of the package publisher.
+For a downloaded archive, verify its external Sigstore bundle with independently
+trusted GitHub CLI tooling before extracting or running any included code.
+Use a full source commit selected outside the archive. Instructions:
+https://github.com/ffookk/ecp/blob/main/docs/VERIFYING_RELEASES.md
+Local packaging creates no signature. A valid provenance proof identifies a
+build; it does not certify the protocol or protect later filesystem changes.
 
 No installation, deployment, release or publication is performed by this
 package. Review the included SECURITY.md and docs/PROTOCOL.md, and the source,
